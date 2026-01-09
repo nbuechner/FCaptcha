@@ -674,7 +674,25 @@
 
         // Timing fingerprints
         jsExecutionTime: this._measureJSExecution(),
+
+        // Advanced fingerprint detections
+        mathFingerprint: this._getMathFingerprint(),
+        errorFingerprint: this._getErrorFingerprint(),
+        domRectFingerprint: this._getDOMRectFingerprint(),
+        cssMediaQueries: this._getCSSMediaQueries(),
+        permissionsInfo: this._getPermissionsInfo(),
+        fontsInfo: this._getFontsInfo(),
       };
+    }
+
+    // Async detections collected separately
+    async collectAsync() {
+      const [speechInfo, webrtcInfo, workerConsistency] = await Promise.all([
+        this._getSpeechInfo(),
+        this._getWebRTCInfo(),
+        this._checkWorkerConsistency()
+      ]);
+      return { speechInfo, webrtcInfo, workerConsistency };
     }
 
     _detectWebdriver() {
@@ -966,6 +984,514 @@
 
         requestAnimationFrame(measure);
       });
+    }
+
+    // ============================================================
+    // Advanced Fingerprint Detection Methods
+    // ============================================================
+
+    /**
+     * Math fingerprint - Different JS engines produce slightly different results
+     * for certain math operations. Headless browsers/VMs may show inconsistencies.
+     */
+    _getMathFingerprint() {
+      try {
+        const results = {
+          // These produce engine-specific results
+          acos: Math.acos(0.123456789),
+          acosh: Math.acosh(1e308),
+          asin: Math.asin(0.123456789),
+          asinh: Math.asinh(1),
+          atanh: Math.atanh(0.5),
+          cbrt: Math.cbrt(100),
+          cosh: Math.cosh(1),
+          expm1: Math.expm1(1),
+          log1p: Math.log1p(10),
+          sinh: Math.sinh(1),
+          tan: Math.tan(-1e308),
+          tanh: Math.tanh(1),
+          // These can expose VM artifacts
+          pow: Math.pow(Math.PI, -100),
+          sin: Math.sin(Math.PI),
+        };
+
+        // Create a hash of the results
+        const str = Object.values(results).map(v => String(v)).join(',');
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+          hash = ((hash << 5) - hash) + str.charCodeAt(i);
+          hash = hash & hash;
+        }
+
+        return {
+          hash: hash.toString(16),
+          // Include a few key values for cross-checking
+          sinPi: results.sin,
+          tanLarge: results.tan,
+          supported: true
+        };
+      } catch (e) {
+        return { supported: false, error: true };
+      }
+    }
+
+    /**
+     * Error fingerprint - Error message formatting varies by engine
+     * Uses safe error triggers (no eval/Function) to get engine-specific messages
+     */
+    _getErrorFingerprint() {
+      try {
+        const errors = {};
+
+        // TypeError - null property access
+        try { null.foo; } catch (e) { errors.typeError = e.message; }
+
+        // RangeError - invalid array length
+        try { [].length = -1; } catch (e) { errors.rangeError = e.message; }
+
+        // URIError - bad URI encoding
+        try { decodeURIComponent('%'); } catch (e) { errors.uriError = e.message; }
+
+        // ReferenceError - undefined variable (via indirect detection)
+        try {
+          const obj = {};
+          obj.undefinedMethod();
+        } catch (e) { errors.refTypeError = e.message; }
+
+        // Generate hash from error messages
+        const str = Object.values(errors).join('|');
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+          hash = ((hash << 5) - hash) + str.charCodeAt(i);
+          hash = hash & hash;
+        }
+
+        return {
+          hash: hash.toString(16),
+          typeError: errors.typeError,
+          supported: true
+        };
+      } catch (e) {
+        return { supported: false, error: true };
+      }
+    }
+
+    /**
+     * DOMRect fingerprint - Element rendering varies slightly between browsers/configs
+     */
+    _getDOMRectFingerprint() {
+      try {
+        const container = document.createElement('div');
+        container.style.cssText = 'position:absolute;left:-9999px;font-size:16px;font-family:Arial,sans-serif;';
+
+        // Test element A - simple text
+        const textA = document.createElement('span');
+        textA.textContent = 'FCaptcha Test String 123';
+        container.appendChild(textA);
+
+        // Test element B - styled text
+        const textB = document.createElement('span');
+        textB.style.cssText = 'letter-spacing:1px;word-spacing:2px;';
+        textB.textContent = 'WWWW 0000';
+        container.appendChild(textB);
+
+        document.body.appendChild(container);
+
+        const rectA = textA.getBoundingClientRect();
+        const rectB = textB.getBoundingClientRect();
+
+        // Create range for additional precision
+        const range = document.createRange();
+        range.selectNode(textA);
+        const rangeRect = range.getBoundingClientRect();
+
+        document.body.removeChild(container);
+
+        // Hash the measurements
+        const values = [
+          rectA.width, rectA.height, rectA.x, rectA.y,
+          rectB.width, rectB.height,
+          rangeRect.width, rangeRect.height
+        ];
+
+        const str = values.map(v => v.toFixed(6)).join(',');
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+          hash = ((hash << 5) - hash) + str.charCodeAt(i);
+          hash = hash & hash;
+        }
+
+        return {
+          hash: hash.toString(16),
+          rectAWidth: rectA.width,
+          rectBWidth: rectB.width,
+          rangeWidth: rangeRect.width,
+          supported: true
+        };
+      } catch (e) {
+        return { supported: false, error: true };
+      }
+    }
+
+    /**
+     * CSS Media Queries - Detect screen/device characteristics
+     */
+    _getCSSMediaQueries() {
+      try {
+        const queries = {
+          // Color scheme preference
+          prefersColorScheme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
+          prefersReducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches,
+          prefersReducedTransparency: window.matchMedia('(prefers-reduced-transparency: reduce)').matches,
+          prefersContrast: window.matchMedia('(prefers-contrast: more)').matches ? 'more' :
+                          window.matchMedia('(prefers-contrast: less)').matches ? 'less' : 'no-preference',
+
+          // Pointer capabilities (helps identify device type)
+          anyHover: window.matchMedia('(any-hover: hover)').matches,
+          anyPointer: window.matchMedia('(any-pointer: fine)').matches ? 'fine' :
+                      window.matchMedia('(any-pointer: coarse)').matches ? 'coarse' : 'none',
+          hover: window.matchMedia('(hover: hover)').matches,
+          pointer: window.matchMedia('(pointer: fine)').matches ? 'fine' :
+                   window.matchMedia('(pointer: coarse)').matches ? 'coarse' : 'none',
+
+          // Display characteristics
+          colorGamut: window.matchMedia('(color-gamut: p3)').matches ? 'p3' :
+                      window.matchMedia('(color-gamut: srgb)').matches ? 'srgb' : 'none',
+          displayMode: window.matchMedia('(display-mode: standalone)').matches ? 'standalone' :
+                       window.matchMedia('(display-mode: fullscreen)').matches ? 'fullscreen' : 'browser',
+          orientation: window.matchMedia('(orientation: portrait)').matches ? 'portrait' : 'landscape',
+
+          // HDR
+          dynamicRange: window.matchMedia('(dynamic-range: high)').matches ? 'high' : 'standard',
+
+          // Forced colors (accessibility)
+          forcedColors: window.matchMedia('(forced-colors: active)').matches
+        };
+
+        return { ...queries, supported: true };
+      } catch (e) {
+        return { supported: false, error: true };
+      }
+    }
+
+    /**
+     * Permissions API - Check browser permission states
+     */
+    _getPermissionsInfo() {
+      // Sync check - async detailed check happens separately
+      try {
+        return {
+          hasPermissionsAPI: 'permissions' in navigator,
+          hasClipboard: 'clipboard' in navigator,
+          hasShare: 'share' in navigator,
+          hasCredentials: 'credentials' in navigator,
+          hasBluetooth: 'bluetooth' in navigator,
+          hasUsb: 'usb' in navigator,
+          hasSerial: 'serial' in navigator,
+          hasHid: 'hid' in navigator,
+          hasXR: 'xr' in navigator,
+          hasGeolocation: 'geolocation' in navigator,
+          hasMIDI: 'requestMIDIAccess' in navigator,
+          supported: true
+        };
+      } catch (e) {
+        return { supported: false, error: true };
+      }
+    }
+
+    /**
+     * Font detection - Check for system fonts
+     * Uses canvas-based detection (fast, doesn't require font loading)
+     */
+    _getFontsInfo() {
+      try {
+        const baseFonts = ['monospace', 'sans-serif', 'serif'];
+        const testFonts = [
+          // Common system fonts
+          'Arial', 'Helvetica', 'Times New Roman', 'Courier New', 'Georgia',
+          'Verdana', 'Trebuchet MS', 'Comic Sans MS', 'Impact', 'Lucida Console',
+          // Mac fonts
+          'Menlo', 'Monaco', 'SF Pro', 'Helvetica Neue',
+          // Windows fonts
+          'Segoe UI', 'Consolas', 'Calibri', 'Cambria',
+          // Linux fonts
+          'DejaVu Sans', 'Liberation Sans', 'Ubuntu', 'Cantarell',
+          // CJK fonts
+          'MS Gothic', 'Meiryo', 'SimHei', 'Microsoft YaHei'
+        ];
+
+        const canvas = document.createElement('canvas');
+        canvas.width = 400;
+        canvas.height = 40;
+        const ctx = canvas.getContext('2d');
+
+        const testString = 'mmMWWLLiiff00';
+        const testSize = '72px';
+
+        // Get baseline widths
+        const baseWidths = {};
+        for (const baseFont of baseFonts) {
+          ctx.font = testSize + ' ' + baseFont;
+          baseWidths[baseFont] = ctx.measureText(testString).width;
+        }
+
+        // Test each font against baselines
+        const detectedFonts = [];
+        for (const font of testFonts) {
+          let detected = false;
+          for (const baseFont of baseFonts) {
+            ctx.font = testSize + ' "' + font + '", ' + baseFont;
+            const width = ctx.measureText(testString).width;
+            if (width !== baseWidths[baseFont]) {
+              detected = true;
+              break;
+            }
+          }
+          if (detected) {
+            detectedFonts.push(font);
+          }
+        }
+
+        // Create hash of detected fonts
+        const str = detectedFonts.join(',');
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+          hash = ((hash << 5) - hash) + str.charCodeAt(i);
+          hash = hash & hash;
+        }
+
+        return {
+          hash: hash.toString(16),
+          count: detectedFonts.length,
+          // Only include a few key fonts to keep payload small
+          hasArial: detectedFonts.includes('Arial'),
+          hasTimesNewRoman: detectedFonts.includes('Times New Roman'),
+          hasSegoeUI: detectedFonts.includes('Segoe UI'),
+          hasSFPro: detectedFonts.includes('SF Pro'),
+          hasDejaVuSans: detectedFonts.includes('DejaVu Sans'),
+          supported: true
+        };
+      } catch (e) {
+        return { supported: false, error: true };
+      }
+    }
+
+    /**
+     * Speech Synthesis API - Get available voices
+     * Voices are OS/browser specific and hard to spoof
+     */
+    async _getSpeechInfo() {
+      try {
+        if (!('speechSynthesis' in window)) {
+          return { supported: false };
+        }
+
+        // Voices may load async
+        const getVoices = () => {
+          return new Promise((resolve) => {
+            let voices = speechSynthesis.getVoices();
+            if (voices.length > 0) {
+              resolve(voices);
+              return;
+            }
+
+            // Wait for voiceschanged event
+            const timeout = setTimeout(() => resolve([]), 1000);
+            speechSynthesis.onvoiceschanged = () => {
+              clearTimeout(timeout);
+              resolve(speechSynthesis.getVoices());
+            };
+          });
+        };
+
+        const voices = await getVoices();
+
+        // Categorize voices
+        const localVoices = voices.filter(v => v.localService);
+        const defaultVoice = voices.find(v => v.default);
+
+        // Get unique languages
+        const languages = [...new Set(voices.map(v => v.lang))];
+
+        // Create hash
+        const voiceNames = voices.map(v => v.name).sort().join(',');
+        let hash = 0;
+        for (let i = 0; i < voiceNames.length; i++) {
+          hash = ((hash << 5) - hash) + voiceNames.charCodeAt(i);
+          hash = hash & hash;
+        }
+
+        return {
+          hash: hash.toString(16),
+          totalVoices: voices.length,
+          localVoices: localVoices.length,
+          languages: languages.length,
+          defaultVoiceLang: defaultVoice?.lang || null,
+          hasGoogleVoices: voices.some(v => v.name.includes('Google')),
+          hasMicrosoftVoices: voices.some(v => v.name.includes('Microsoft')),
+          hasAppleVoices: voices.some(v => v.name.includes('Samantha') || v.name.includes('Alex')),
+          supported: true
+        };
+      } catch (e) {
+        return { supported: false, error: true };
+      }
+    }
+
+    /**
+     * WebRTC fingerprinting - Get local IPs and media devices
+     * Very effective for detecting VMs, proxies, and headless browsers
+     */
+    async _getWebRTCInfo() {
+      try {
+        const info = {
+          supported: 'RTCPeerConnection' in window,
+          mediaDevices: { supported: false },
+          localIPs: []
+        };
+
+        if (!info.supported) return info;
+
+        // Get media devices (doesn't require permission for enumeration)
+        if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+          try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            info.mediaDevices = {
+              supported: true,
+              audioInputs: devices.filter(d => d.kind === 'audioinput').length,
+              audioOutputs: devices.filter(d => d.kind === 'audiooutput').length,
+              videoInputs: devices.filter(d => d.kind === 'videoinput').length,
+              // Headless browsers typically have 0 devices
+              totalDevices: devices.length
+            };
+          } catch (e) {
+            info.mediaDevices = { supported: false, error: true };
+          }
+        }
+
+        // Get local IPs via WebRTC (no permission needed)
+        try {
+          const pc = new RTCPeerConnection({
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+          });
+
+          const localIPs = new Set();
+
+          pc.onicecandidate = (event) => {
+            if (event.candidate) {
+              const candidate = event.candidate.candidate;
+              // Extract IP addresses from ICE candidates
+              const ipRegex = /([0-9]{1,3}\.){3}[0-9]{1,3}/g;
+              const matches = candidate.match(ipRegex);
+              if (matches) {
+                matches.forEach(ip => {
+                  // Filter out STUN server responses, keep only local IPs
+                  if (ip.startsWith('192.168.') || ip.startsWith('10.') ||
+                      ip.startsWith('172.') || ip.startsWith('169.254.')) {
+                    localIPs.add(ip);
+                  }
+                });
+              }
+            }
+          };
+
+          // Create data channel to trigger ICE gathering
+          pc.createDataChannel('');
+          await pc.createOffer().then(offer => pc.setLocalDescription(offer));
+
+          // Wait briefly for ICE candidates
+          await new Promise(r => setTimeout(r, 500));
+
+          info.localIPs = Array.from(localIPs);
+          info.hasLocalIP = localIPs.size > 0;
+
+          pc.close();
+        } catch (e) {
+          info.localIPError = true;
+        }
+
+        return info;
+      } catch (e) {
+        return { supported: false, error: true };
+      }
+    }
+
+    /**
+     * Worker consistency check - Compare main thread vs worker values
+     * Spoofed values often don't match between contexts
+     */
+    async _checkWorkerConsistency() {
+      try {
+        if (typeof Worker === 'undefined') {
+          return { supported: false };
+        }
+
+        // Create inline worker
+        const workerCode = `
+          self.onmessage = function() {
+            const data = {
+              userAgent: navigator.userAgent,
+              language: navigator.language,
+              languages: navigator.languages ? Array.from(navigator.languages) : [],
+              platform: navigator.platform,
+              hardwareConcurrency: navigator.hardwareConcurrency,
+              deviceMemory: navigator.deviceMemory,
+              timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+              timezoneOffset: new Date().getTimezoneOffset()
+            };
+            self.postMessage(data);
+          };
+        `;
+
+        const blob = new Blob([workerCode], { type: 'application/javascript' });
+        const worker = new Worker(URL.createObjectURL(blob));
+
+        const workerData = await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('timeout')), 2000);
+          worker.onmessage = (e) => {
+            clearTimeout(timeout);
+            resolve(e.data);
+          };
+          worker.onerror = () => {
+            clearTimeout(timeout);
+            reject(new Error('worker error'));
+          };
+          worker.postMessage('collect');
+        });
+
+        worker.terminate();
+
+        // Compare with main thread values
+        const mainData = {
+          userAgent: navigator.userAgent,
+          language: navigator.language,
+          languages: navigator.languages ? Array.from(navigator.languages) : [],
+          platform: navigator.platform,
+          hardwareConcurrency: navigator.hardwareConcurrency,
+          deviceMemory: navigator.deviceMemory,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          timezoneOffset: new Date().getTimezoneOffset()
+        };
+
+        // Check for mismatches (indicates spoofing)
+        const mismatches = [];
+        if (workerData.userAgent !== mainData.userAgent) mismatches.push('userAgent');
+        if (workerData.language !== mainData.language) mismatches.push('language');
+        if (workerData.platform !== mainData.platform) mismatches.push('platform');
+        if (workerData.hardwareConcurrency !== mainData.hardwareConcurrency) mismatches.push('hardwareConcurrency');
+        if (workerData.deviceMemory !== mainData.deviceMemory) mismatches.push('deviceMemory');
+        if (workerData.timezone !== mainData.timezone) mismatches.push('timezone');
+        if (workerData.timezoneOffset !== mainData.timezoneOffset) mismatches.push('timezoneOffset');
+        if (JSON.stringify(workerData.languages) !== JSON.stringify(mainData.languages)) mismatches.push('languages');
+
+        return {
+          supported: true,
+          consistent: mismatches.length === 0,
+          mismatches: mismatches,
+          mismatchCount: mismatches.length
+        };
+      } catch (e) {
+        return { supported: false, error: true };
+      }
     }
   }
 
@@ -1383,11 +1909,16 @@
       this.label.textContent = 'Verifying...';
 
       try {
-        // Collect signals
+        // Collect signals (sync and async in parallel)
         const behavioralData = this.behavioral.analyze();
         const clickData = this.behavioral.analyzeClick(e.clientX, e.clientY, rect);
         const envData = this.environmental.collect();
-        const rafData = await this.environmental.measureRAFConsistency();
+
+        // Collect async data in parallel
+        const [rafData, asyncEnvData] = await Promise.all([
+          this.environmental.measureRAFConsistency(),
+          this.environmental.collectAsync()
+        ]);
 
         // Wait for PoW solution (should already be solved in background)
         const powSolution = await this.powManager.getSolution(this.options.siteKey);
@@ -1405,7 +1936,7 @@
 
         const signals = {
           behavioral: { ...behavioralData, ...clickData },
-          environmental: { ...envData, rafConsistency: rafData },
+          environmental: { ...envData, rafConsistency: rafData, ...asyncEnvData },
           temporal: temporalData,
           formAnalysis: formAnalysis,
           meta: {
@@ -1667,14 +2198,19 @@
         difficulty: powSolution.difficulty
       };
       const temporalData = this.temporal.collect(Date.now());
-      const rafData = await this.environmental.measureRAFConsistency();
+
+      // Collect async environmental data in parallel
+      const [rafData, asyncEnvData] = await Promise.all([
+        this.environmental.measureRAFConsistency(),
+        this.environmental.collectAsync()
+      ]);
 
       // Get form interaction analysis
       const formAnalysis = getFormAnalyzer().analyze();
 
       const signals = {
         behavioral: behavioralData,
-        environmental: { ...envData, rafConsistency: rafData },
+        environmental: { ...envData, rafConsistency: rafData, ...asyncEnvData },
         temporal: temporalData,
         formAnalysis: formAnalysis,
         meta: {

@@ -777,6 +777,10 @@ function runVerification(signals, ip, siteKey, userAgent, headers = {}, ja3Hash 
     detections.push(...formDetections);
   }
 
+  // Add advanced fingerprint detection analysis
+  const advancedDetections = detection.analyzeAdvancedSignals(signals, userAgent);
+  detections.push(...advancedDetections);
+
   const categoryScores = calculateCategoryScores(detections);
   const finalScore = calculateFinalScore(categoryScores);
 

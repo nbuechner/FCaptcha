@@ -431,6 +431,317 @@ function analyzeFormInteraction(formAnalysis) {
   return detections;
 }
 
+// =============================================================================
+// Advanced Fingerprint Detection Functions
+// =============================================================================
+
+/**
+ * Analyze WebRTC signals for headless browser and VM detection
+ */
+function analyzeWebRTC(webrtcInfo) {
+  if (!webrtcInfo || !webrtcInfo.supported) return [];
+
+  const detections = [];
+
+  // Check media devices - headless browsers typically have 0 devices
+  const mediaDevices = webrtcInfo.mediaDevices || {};
+  if (mediaDevices.supported && mediaDevices.totalDevices === 0) {
+    detections.push({
+      category: 'headless',
+      score: 0.7,
+      confidence: 0.75,
+      reason: 'No media devices detected (typical of headless browsers)'
+    });
+  }
+
+  // Suspicious: has video inputs but no audio (unusual)
+  if (mediaDevices.supported && mediaDevices.videoInputs > 0 && mediaDevices.audioInputs === 0) {
+    detections.push({
+      category: 'bot',
+      score: 0.4,
+      confidence: 0.5,
+      reason: 'Has video devices but no audio devices (unusual configuration)'
+    });
+  }
+
+  // Check local IP detection - VMs and some headless setups may not expose local IPs
+  if (webrtcInfo.hasLocalIP === false && !webrtcInfo.localIPError) {
+    detections.push({
+      category: 'headless',
+      score: 0.4,
+      confidence: 0.5,
+      reason: 'No local IP addresses detected via WebRTC'
+    });
+  }
+
+  return detections;
+}
+
+/**
+ * Analyze Speech API signals - voices are OS/browser specific and hard to spoof
+ */
+function analyzeSpeechAPI(speechInfo) {
+  if (!speechInfo || !speechInfo.supported) return [];
+
+  const detections = [];
+
+  // No voices at all - suspicious
+  if (speechInfo.totalVoices === 0) {
+    detections.push({
+      category: 'headless',
+      score: 0.6,
+      confidence: 0.7,
+      reason: 'No speech synthesis voices available'
+    });
+  }
+
+  // Very few voices (less than 5) - could be headless or minimal VM
+  if (speechInfo.totalVoices > 0 && speechInfo.totalVoices < 5) {
+    detections.push({
+      category: 'headless',
+      score: 0.3,
+      confidence: 0.4,
+      reason: `Very few speech voices available (${speechInfo.totalVoices})`
+    });
+  }
+
+  // No local voices - all remote/network voices suggests unusual setup
+  if (speechInfo.localVoices === 0 && speechInfo.totalVoices > 0) {
+    detections.push({
+      category: 'bot',
+      score: 0.3,
+      confidence: 0.4,
+      reason: 'No local speech synthesis voices'
+    });
+  }
+
+  return detections;
+}
+
+/**
+ * Analyze Worker consistency - spoofed values often don't match between contexts
+ */
+function analyzeWorkerConsistency(workerConsistency) {
+  if (!workerConsistency || !workerConsistency.supported) return [];
+
+  const detections = [];
+
+  // Mismatches indicate fingerprint spoofing
+  if (!workerConsistency.consistent && workerConsistency.mismatchCount > 0) {
+    const score = Math.min(0.9, 0.3 + (workerConsistency.mismatchCount * 0.15));
+    detections.push({
+      category: 'bot',
+      score: score,
+      confidence: 0.85,
+      reason: `Worker/main thread mismatch detected: ${workerConsistency.mismatches.join(', ')}`
+    });
+  }
+
+  return detections;
+}
+
+/**
+ * Analyze CSS Media Queries for environment consistency
+ */
+function analyzeCSSMediaQueries(cssMedia, signals) {
+  if (!cssMedia || !cssMedia.supported) return [];
+
+  const detections = [];
+  const nav = (signals.environmental || {}).navigator || {};
+
+  // Check pointer consistency with touch capability
+  const maxTouch = nav.maxTouchPoints || 0;
+  if (cssMedia.pointer === 'coarse' && maxTouch === 0) {
+    detections.push({
+      category: 'bot',
+      score: 0.5,
+      confidence: 0.6,
+      reason: 'CSS reports coarse pointer but no touch support'
+    });
+  }
+
+  // Check hover capability - headless browsers may have unusual values
+  if (cssMedia.hover === false && cssMedia.pointer === 'fine') {
+    detections.push({
+      category: 'bot',
+      score: 0.3,
+      confidence: 0.4,
+      reason: 'Fine pointer reported but no hover capability'
+    });
+  }
+
+  // Forced colors mode with reduced motion - accessibility features
+  // Note: These are NOT suspicious on their own, just for fingerprinting
+  // Don't penalize accessibility users
+
+  return detections;
+}
+
+/**
+ * Analyze font detection results for consistency
+ */
+function analyzeFonts(fontsInfo, userAgent) {
+  if (!fontsInfo || !fontsInfo.supported) return [];
+
+  const detections = [];
+
+  // Very few fonts detected could indicate headless browser
+  if (fontsInfo.count < 3) {
+    detections.push({
+      category: 'headless',
+      score: 0.5,
+      confidence: 0.5,
+      reason: `Very few fonts detected (${fontsInfo.count})`
+    });
+  }
+
+  // Check OS-specific fonts against UA
+  const ua = (userAgent || '').toLowerCase();
+
+  // Windows UA but no Segoe UI
+  if (ua.includes('windows') && fontsInfo.hasSegoeUI === false && fontsInfo.count > 5) {
+    detections.push({
+      category: 'bot',
+      score: 0.5,
+      confidence: 0.6,
+      reason: 'Windows UA but Segoe UI font not detected'
+    });
+  }
+
+  // Mac UA but no SF Pro (modern macOS)
+  if ((ua.includes('mac os x') || ua.includes('macintosh')) && fontsInfo.hasSFPro === false &&
+      ua.includes('10_15') === false && ua.includes('10_14') === false && fontsInfo.count > 5) {
+    // SF Pro is on macOS 10.15+ (Catalina and later)
+    detections.push({
+      category: 'bot',
+      score: 0.3,
+      confidence: 0.4,
+      reason: 'Modern macOS UA but SF Pro font not detected'
+    });
+  }
+
+  // Linux UA but no DejaVu Sans (very common on Linux)
+  if (ua.includes('linux') && !ua.includes('android') &&
+      fontsInfo.hasDejaVuSans === false && fontsInfo.count > 5) {
+    detections.push({
+      category: 'bot',
+      score: 0.4,
+      confidence: 0.5,
+      reason: 'Linux UA but DejaVu Sans font not detected'
+    });
+  }
+
+  return detections;
+}
+
+/**
+ * Analyze permissions/API availability for headless detection
+ */
+function analyzePermissions(permissionsInfo) {
+  if (!permissionsInfo || !permissionsInfo.supported) return [];
+
+  const detections = [];
+
+  // Count available APIs
+  const apiKeys = [
+    'hasPermissionsAPI', 'hasClipboard', 'hasShare', 'hasCredentials',
+    'hasBluetooth', 'hasUsb', 'hasSerial', 'hasHid', 'hasXR',
+    'hasGeolocation', 'hasMIDI'
+  ];
+
+  const availableApis = apiKeys.filter(key => permissionsInfo[key] === true).length;
+
+  // Very few APIs available could indicate minimal/headless browser
+  if (availableApis < 3) {
+    detections.push({
+      category: 'headless',
+      score: 0.4,
+      confidence: 0.5,
+      reason: `Very few navigator APIs available (${availableApis})`
+    });
+  }
+
+  return detections;
+}
+
+/**
+ * Analyze DOMRect/geometry fingerprint for rendering anomalies
+ */
+function analyzeDOMRect(domRectInfo) {
+  if (!domRectInfo || !domRectInfo.supported) return [];
+
+  const detections = [];
+
+  // Check for zero or very small dimensions (rendering issues)
+  if (domRectInfo.rectAWidth === 0 || domRectInfo.rectBWidth === 0) {
+    detections.push({
+      category: 'headless',
+      score: 0.6,
+      confidence: 0.7,
+      reason: 'DOMRect rendering returned zero-width elements'
+    });
+  }
+
+  // Check for exact integer values (unusual in real browsers)
+  if (domRectInfo.rectAWidth === Math.floor(domRectInfo.rectAWidth) &&
+      domRectInfo.rectBWidth === Math.floor(domRectInfo.rectBWidth) &&
+      domRectInfo.rangeWidth === Math.floor(domRectInfo.rangeWidth)) {
+    detections.push({
+      category: 'bot',
+      score: 0.3,
+      confidence: 0.4,
+      reason: 'DOMRect measurements are all exact integers (unusual)'
+    });
+  }
+
+  return detections;
+}
+
+/**
+ * Master function to analyze all advanced fingerprint signals
+ */
+function analyzeAdvancedSignals(signals, userAgent) {
+  const detections = [];
+  const env = signals.environmental || {};
+
+  // WebRTC analysis
+  if (env.webrtcInfo) {
+    detections.push(...analyzeWebRTC(env.webrtcInfo));
+  }
+
+  // Speech API analysis
+  if (env.speechInfo) {
+    detections.push(...analyzeSpeechAPI(env.speechInfo));
+  }
+
+  // Worker consistency analysis
+  if (env.workerConsistency) {
+    detections.push(...analyzeWorkerConsistency(env.workerConsistency));
+  }
+
+  // CSS Media Queries analysis
+  if (env.cssMediaQueries) {
+    detections.push(...analyzeCSSMediaQueries(env.cssMediaQueries, signals));
+  }
+
+  // Font analysis
+  if (env.fontsInfo) {
+    detections.push(...analyzeFonts(env.fontsInfo, userAgent));
+  }
+
+  // Permissions analysis
+  if (env.permissionsInfo) {
+    detections.push(...analyzePermissions(env.permissionsInfo));
+  }
+
+  // DOMRect analysis
+  if (env.domRectFingerprint) {
+    detections.push(...analyzeDOMRect(env.domRectFingerprint));
+  }
+
+  return detections;
+}
+
 module.exports = {
   isDatacenterIP,
   checkIPReputation,
@@ -438,5 +749,14 @@ module.exports = {
   parseUserAgent,
   checkBrowserConsistency,
   checkJA3Fingerprint,
-  analyzeFormInteraction
+  analyzeFormInteraction,
+  // Advanced fingerprint detection functions
+  analyzeWebRTC,
+  analyzeSpeechAPI,
+  analyzeWorkerConsistency,
+  analyzeCSSMediaQueries,
+  analyzeFonts,
+  analyzePermissions,
+  analyzeDOMRect,
+  analyzeAdvancedSignals
 };

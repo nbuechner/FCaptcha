@@ -739,6 +739,266 @@ async function testInvisibleMode() {
   }
 }
 
+async function testAdvancedDetections() {
+  log('\n[Advanced Fingerprint Detection]', colors.cyan);
+
+  // Test WebRTC detection - no media devices (headless indicator)
+  const noMediaDevicesResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        environmental: {
+          webrtcInfo: {
+            supported: true,
+            mediaDevices: {
+              supported: true,
+              audioInputs: 0,
+              audioOutputs: 0,
+              videoInputs: 0,
+              totalDevices: 0
+            },
+            hasLocalIP: false
+          }
+        }
+      }
+    }
+  });
+  assertDetection(noMediaDevicesResult, 'headless', true, 'Detects no media devices via WebRTC');
+
+  // Test Speech API - no voices (headless indicator)
+  const noVoicesResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        environmental: {
+          speechInfo: {
+            supported: true,
+            totalVoices: 0,
+            localVoices: 0,
+            languages: 0
+          }
+        }
+      }
+    }
+  });
+  assertDetection(noVoicesResult, 'headless', true, 'Detects no speech synthesis voices');
+
+  // Test Worker consistency - mismatch detection
+  const workerMismatchResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        environmental: {
+          workerConsistency: {
+            supported: true,
+            consistent: false,
+            mismatches: ['userAgent', 'platform', 'timezone'],
+            mismatchCount: 3
+          }
+        }
+      }
+    }
+  });
+  assertDetection(workerMismatchResult, 'bot', true, 'Detects worker/main thread mismatch');
+
+  // Test Font detection - Windows UA without Segoe UI
+  const noSegoeUIResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        environmental: {
+          fontsInfo: {
+            supported: true,
+            count: 10,
+            hasArial: true,
+            hasTimesNewRoman: true,
+            hasSegoeUI: false,  // Should have this on Windows!
+            hasSFPro: false,
+            hasDejaVuSans: false
+          }
+        }
+      }
+    }
+  });
+  assertDetection(noSegoeUIResult, 'bot', true, 'Detects Windows UA without Segoe UI font');
+
+  // Test very few fonts (headless indicator)
+  const fewFontsResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        environmental: {
+          fontsInfo: {
+            supported: true,
+            count: 2,
+            hasArial: true,
+            hasTimesNewRoman: false,
+            hasSegoeUI: false,
+            hasSFPro: false,
+            hasDejaVuSans: false
+          }
+        }
+      }
+    }
+  });
+  assertDetection(fewFontsResult, 'headless', true, 'Detects very few system fonts');
+
+  // Test CSS Media Query inconsistency - coarse pointer but no touch
+  const pointerMismatchResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        environmental: {
+          cssMediaQueries: {
+            supported: true,
+            pointer: 'coarse',  // Indicates touch device
+            hover: false,
+            anyPointer: 'coarse',
+            anyHover: false
+          },
+          navigator: {
+            maxTouchPoints: 0  // But no touch support!
+          }
+        }
+      }
+    }
+  });
+  assertDetection(pointerMismatchResult, 'bot', true, 'Detects CSS pointer/touch mismatch');
+
+  // Test DOMRect with zero dimensions
+  const zeroDOMRectResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        environmental: {
+          domRectFingerprint: {
+            supported: true,
+            hash: 'abc123',
+            rectAWidth: 0,
+            rectBWidth: 0,
+            rangeWidth: 0
+          }
+        }
+      }
+    }
+  });
+  assertDetection(zeroDOMRectResult, 'headless', true, 'Detects zero-dimension DOMRect');
+
+  // Test legitimate advanced signals (should pass)
+  const legitimateAdvancedResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        environmental: {
+          automationFlags: {
+            chrome: true,
+            platform: 'MacIntel',
+            plugins: 5,
+          },
+          webrtcInfo: {
+            supported: true,
+            mediaDevices: {
+              supported: true,
+              audioInputs: 2,
+              audioOutputs: 2,
+              videoInputs: 1,
+              totalDevices: 5
+            },
+            hasLocalIP: true,
+            localIPs: ['192.168.1.100']
+          },
+          speechInfo: {
+            supported: true,
+            totalVoices: 67,
+            localVoices: 45,
+            languages: 24,
+            hasAppleVoices: true
+          },
+          workerConsistency: {
+            supported: true,
+            consistent: true,
+            mismatches: [],
+            mismatchCount: 0
+          },
+          fontsInfo: {
+            supported: true,
+            count: 18,
+            hasArial: true,
+            hasTimesNewRoman: true,
+            hasSegoeUI: false,
+            hasSFPro: true,  // Mac font
+            hasDejaVuSans: false
+          },
+          cssMediaQueries: {
+            supported: true,
+            pointer: 'fine',
+            hover: true,
+            anyPointer: 'fine',
+            anyHover: true,
+            prefersColorScheme: 'dark',
+            dynamicRange: 'high'
+          },
+          domRectFingerprint: {
+            supported: true,
+            hash: 'abc123def',
+            rectAWidth: 167.234375,
+            rectBWidth: 89.5625,
+            rangeWidth: 167.234375
+          },
+          permissionsInfo: {
+            supported: true,
+            hasPermissionsAPI: true,
+            hasClipboard: true,
+            hasShare: true,
+            hasCredentials: true,
+            hasGeolocation: true,
+            hasBluetooth: true
+          }
+        },
+        behavioral: {
+          interactionDuration: 1500,
+          velocityVariance: 0.8,
+          microTremorScore: 0.6,
+        }
+      }
+    }
+  });
+  assertScore(legitimateAdvancedResult, 0, 0.3, 'Legitimate advanced signals get low score');
+}
+
 async function testProofOfWork() {
   log('\n[Proof of Work]', colors.cyan);
 
@@ -936,6 +1196,7 @@ async function runTests() {
   await testBehavioralSignals();
   await testVisionAIDetection();
   await testFormAnalysis();
+  await testAdvancedDetections();
   await testProofOfWork();
   await testTokenVerification();
   await testInvisibleMode();
