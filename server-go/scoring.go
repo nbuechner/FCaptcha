@@ -209,13 +209,13 @@ func NewScoringEngine(secretKey string) *ScoringEngine {
 		weights: map[ThreatCategory]float64{
 			CategoryVisionAI:    0.15,
 			CategoryHeadless:    0.15,
-			CategoryAutomation:  0.10,
+			CategoryAutomation:  0.08,
 			CategoryCDP:         0.12,
 			CategoryBehavioral:  0.18,
-			CategoryFingerprint: 0.10,
+			CategoryFingerprint: 0.08,
 			CategoryRateLimit:   0.05,
-			CategoryDatacenter:  0.10,
-			CategoryTorVPN:      0.05,
+			CategoryDatacenter:  0.07,
+			CategoryTorVPN:      0.02,
 			CategoryBot:         0.10,
 		},
 		uaPatterns: compileUAPatterns(),
@@ -561,6 +561,35 @@ func (e *ScoringEngine) detectVisionAI(signals map[string]interface{}) []Detecti
 	behavioral := getMap(signals, "behavioral")
 	temporal := getMap(signals, "temporal")
 
+	// Zero/minimal mouse movement - strong indicator of AI agent or programmatic click
+	// Exempt: touch users (mobile) and keyboard-only users (accessibility)
+	totalPoints := getFloat(behavioral, "totalPoints")
+	trajectoryLen := getFloat(behavioral, "trajectoryLength")
+	approachPts := getFloat(behavioral, "approachPoints")
+	touchEventsAI := getFloat(behavioral, "touchEvents")
+	keyEventsAI := getFloat(behavioral, "keyEvents")
+	isTouchUser := touchEventsAI > 0
+	isKeyboardUser := keyEventsAI > 0 && totalPoints == 0
+
+	if totalPoints < 5 && trajectoryLen < 10 && !isTouchUser && !isKeyboardUser {
+		results = append(results, DetectionResult{
+			Category:   CategoryVisionAI,
+			Score:      0.9,
+			Confidence: 0.85,
+			Reason:     "No mouse movement detected before click (AI agent pattern)",
+			Details:    map[string]interface{}{"totalPoints": totalPoints, "trajectoryLength": trajectoryLen},
+		})
+	}
+
+	if approachPts == 0 && !isTouchUser && !isKeyboardUser {
+		results = append(results, DetectionResult{
+			Category:   CategoryVisionAI,
+			Score:      0.7,
+			Confidence: 0.8,
+			Reason:     "No approach trajectory to target",
+		})
+	}
+
 	// Check PoW timing (reveals API round-trip)
 	if pow := getMap(temporal, "pow"); pow != nil {
 		duration := getFloat(pow, "duration")
@@ -881,9 +910,34 @@ func (e *ScoringEngine) detectBehavioral(signals map[string]interface{}) []Detec
 	behavioral := getMap(signals, "behavioral")
 	temporal := getMap(signals, "temporal")
 
+	// Insufficient mouse data - critical check for zero-click bots
+	// Exempt: touch users (mobile) and keyboard-only users (accessibility)
+	totalPoints := getFloat(behavioral, "totalPoints")
+	trajectoryLength := getFloat(behavioral, "trajectoryLength")
+	touchEvents := getFloat(behavioral, "touchEvents")
+	keyEvents := getFloat(behavioral, "keyEvents")
+	isTouchUsr := touchEvents > 0
+	isKbdUsr := keyEvents > 0 && totalPoints == 0
+
+	if totalPoints == 0 && !isTouchUsr && !isKbdUsr {
+		results = append(results, DetectionResult{
+			Category:   CategoryBehavioral,
+			Score:      0.8,
+			Confidence: 0.9,
+			Reason:     "Zero mouse, touch, or keyboard events recorded",
+		})
+	} else if totalPoints < 10 && !isTouchUsr && !isKbdUsr && trajectoryLength < 30 {
+		results = append(results, DetectionResult{
+			Category:   CategoryBehavioral,
+			Score:      0.6,
+			Confidence: 0.7,
+			Reason:     "Insufficient mouse movement before interaction",
+			Details:    map[string]interface{}{"totalPoints": totalPoints, "trajectoryLength": trajectoryLength},
+		})
+	}
+
 	// Velocity variance
 	velocityVariance := getFloat(behavioral, "velocityVariance")
-	trajectoryLength := getFloat(behavioral, "trajectoryLength")
 	if velocityVariance < 0.02 && trajectoryLength > 50 {
 		results = append(results, DetectionResult{
 			Category:   CategoryBehavioral,
@@ -957,7 +1011,6 @@ func (e *ScoringEngine) detectBehavioral(signals map[string]interface{}) []Detec
 
 	// No scroll/keyboard
 	scrollEvents := getFloat(behavioral, "scrollEvents")
-	keyEvents := getFloat(behavioral, "keyEvents")
 	if scrollEvents == 0 && keyEvents == 0 && interactionTime > 5000 {
 		results = append(results, DetectionResult{
 			Category:   CategoryBehavioral,
@@ -969,7 +1022,6 @@ func (e *ScoringEngine) detectBehavioral(signals map[string]interface{}) []Detec
 
 	// Direction changes
 	dirChanges := getFloat(behavioral, "directionChanges")
-	totalPoints := getFloat(behavioral, "totalPoints")
 	if totalPoints > 50 && dirChanges < 3 {
 		results = append(results, DetectionResult{
 			Category:   CategoryBehavioral,

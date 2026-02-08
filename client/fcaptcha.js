@@ -1878,6 +1878,7 @@
       document.addEventListener('scroll', (e) => this.behavioral.recordScroll(e), { passive: true });
       document.addEventListener('keydown', (e) => this.behavioral.recordKeyEvent(e), { passive: true });
       document.addEventListener('keyup', (e) => this.behavioral.recordKeyEvent(e), { passive: true });
+      document.addEventListener('touchstart', (e) => this.behavioral.recordTouch(e), { passive: true });
       document.addEventListener('touchmove', (e) => this.behavioral.recordTouch(e), { passive: true });
       document.addEventListener('focus', (e) => this.behavioral.recordFocus(e), { passive: true, capture: true });
       document.addEventListener('blur', (e) => this.behavioral.recordFocus(e), { passive: true, capture: true });
@@ -1994,6 +1995,13 @@
       const b = signals.behavioral;
       const e = signals.environmental;
       const t = signals.temporal;
+
+      // Zero mouse movement detection (AI agent / programmatic click)
+      // Exempt touch users (mobile) and keyboard-only users (accessibility)
+      const isTouchUser = (b.touchEvents || 0) > 0;
+      const isKbdUser = (b.keyEvents || 0) > 0 && b.totalPoints === 0;
+      if (b.totalPoints < 5 && b.trajectoryLength < 10 && !isTouchUser && !isKbdUser) score += 0.35;
+      else if (b.totalPoints < 10 && !isTouchUser && !isKbdUser && b.trajectoryLength < 30) score += 0.15;
 
       // Behavioral (40%)
       if (b.microTremorScore < 0.2) score += 0.12;
@@ -2265,6 +2273,13 @@
       const e = signals.environmental;
       const t = signals.temporal;
       const m = signals.meta;
+
+      // Zero mouse movement detection (AI agent / programmatic click)
+      // Exempt touch users (mobile) and keyboard-only users (accessibility)
+      const isTouchUsr = (b.touchEvents || 0) > 0;
+      const isKbdUsr = (b.keyEvents || 0) > 0 && b.totalPoints === 0;
+      if (b.totalPoints < 5 && b.trajectoryLength < 10 && !isTouchUsr && !isKbdUsr) score += 0.35;
+      else if (b.totalPoints < 10 && !isTouchUsr && !isKbdUsr && b.trajectoryLength < 30) score += 0.15;
 
       // Behavioral
       if (b.microTremorScore < 0.2) score += 0.12;

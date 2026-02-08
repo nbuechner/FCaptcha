@@ -253,7 +253,13 @@ async function testHeaderAnalysis() {
       'Accept-Language': 'en-US,en;q=0.9',
       'Accept-Encoding': 'gzip, deflate, br',
     },
-    body: { siteKey: 'test', signals: {} }
+    body: { siteKey: 'test', signals: {
+      behavioral: {
+        totalPoints: 80, trajectoryLength: 350, velocityVariance: 0.8,
+        microTremorScore: 0.6, directionChanges: 15, mouseEventRate: 60,
+        interactionDuration: 1500, approachPoints: 12,
+      }
+    } }
   });
   assertScore(goodHeadersResult, 0, 0.3, 'Normal headers get low score');
 }
@@ -330,6 +336,11 @@ async function testBrowserConsistency() {
     body: {
       siteKey: 'test',
       signals: {
+        behavioral: {
+          totalPoints: 80, trajectoryLength: 350, velocityVariance: 0.8,
+          microTremorScore: 0.6, directionChanges: 15, mouseEventRate: 60,
+          interactionDuration: 1500, approachPoints: 12,
+        },
         environmental: {
           automationFlags: {
             chrome: true,
@@ -616,6 +627,11 @@ async function testFormAnalysis() {
     body: {
       siteKey: 'test',
       signals: {
+        behavioral: {
+          totalPoints: 80, trajectoryLength: 350, velocityVariance: 0.8,
+          microTremorScore: 0.6, directionChanges: 15, mouseEventRate: 60,
+          interactionDuration: 1500, approachPoints: 12,
+        },
         formAnalysis: {
           pageLoadToFirstInteraction: 1500,
           pageLoadToNow: 5000,
@@ -664,9 +680,10 @@ async function testTokenVerification() {
       siteKey: 'test',
       signals: {
         behavioral: {
-          interactionDuration: 1500,
-          velocityVariance: 0.8,
-          microTremorScore: 0.6,
+          totalPoints: 80, trajectoryLength: 350,
+          interactionDuration: 1500, velocityVariance: 0.8,
+          microTremorScore: 0.6, directionChanges: 15,
+          mouseEventRate: 60, approachPoints: 12,
         },
         environmental: {
           automationFlags: {
@@ -723,8 +740,9 @@ async function testInvisibleMode() {
       action: 'login',
       signals: {
         behavioral: {
-          interactionDuration: 2000,
-          velocityVariance: 0.5,
+          totalPoints: 80, trajectoryLength: 350,
+          interactionDuration: 2000, velocityVariance: 0.5,
+          directionChanges: 15, mouseEventRate: 60, approachPoints: 12,
         }
       }
     }
@@ -989,9 +1007,10 @@ async function testAdvancedDetections() {
           }
         },
         behavioral: {
-          interactionDuration: 1500,
-          velocityVariance: 0.8,
-          microTremorScore: 0.6,
+          totalPoints: 80, trajectoryLength: 350,
+          interactionDuration: 1500, velocityVariance: 0.8,
+          microTremorScore: 0.6, directionChanges: 15,
+          mouseEventRate: 60, approachPoints: 12,
         }
       }
     }
@@ -1055,9 +1074,10 @@ async function testProofOfWork() {
         siteKey: 'test',
         signals: {
           behavioral: {
-            interactionDuration: 1500,
-            velocityVariance: 0.8,
-            microTremorScore: 0.6,
+            totalPoints: 80, trajectoryLength: 350,
+            interactionDuration: 1500, velocityVariance: 0.8,
+            microTremorScore: 0.6, directionChanges: 15,
+            mouseEventRate: 60, approachPoints: 12,
           },
           environmental: {
             automationFlags: {

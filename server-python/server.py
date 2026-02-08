@@ -276,11 +276,11 @@ AUTOMATION_UA_PATTERNS = [
 WEIGHTS = {
     ThreatCategory.VISION_AI: 0.15,
     ThreatCategory.HEADLESS: 0.15,
-    ThreatCategory.AUTOMATION: 0.10,
+    ThreatCategory.AUTOMATION: 0.08,
     ThreatCategory.CDP: 0.12,
     ThreatCategory.BEHAVIORAL: 0.18,
-    ThreatCategory.FINGERPRINT: 0.10,
-    ThreatCategory.RATE_LIMIT: 0.10,
+    ThreatCategory.FINGERPRINT: 0.08,
+    ThreatCategory.RATE_LIMIT: 0.07,
     ThreatCategory.BOT: 0.10,
 }
 
@@ -303,6 +303,29 @@ def detect_vision_ai(signals: Dict) -> List[Detection]:
     detections = []
     b = signals.get("behavioral", {})
     t = signals.get("temporal", {})
+
+    # Zero/minimal mouse movement - strong indicator of AI agent or programmatic click
+    # Exempt: touch users (mobile) and keyboard-only users (accessibility)
+    total_points = b.get("totalPoints", 0)
+    trajectory = b.get("trajectoryLength", 0)
+    approach_pts = b.get("approachPoints", 0)
+    touch_events = b.get("touchEvents", 0)
+    key_events = b.get("keyEvents", 0)
+    is_touch_user = touch_events > 0
+    is_keyboard_user = key_events > 0 and total_points == 0
+
+    if total_points < 5 and trajectory < 10 and not is_touch_user and not is_keyboard_user:
+        detections.append(Detection(
+            ThreatCategory.VISION_AI, 0.9, 0.85,
+            "No mouse movement detected before click (AI agent pattern)",
+            {"totalPoints": total_points, "trajectoryLength": trajectory}
+        ))
+
+    if approach_pts == 0 and not is_touch_user and not is_keyboard_user:
+        detections.append(Detection(
+            ThreatCategory.VISION_AI, 0.7, 0.8,
+            "No approach trajectory to target"
+        ))
 
     # PoW timing
     pow_data = t.get("pow", {})
@@ -512,9 +535,29 @@ def detect_behavioral(signals: Dict) -> List[Detection]:
     b = signals.get("behavioral", {})
     t = signals.get("temporal", {})
 
+    # Insufficient mouse data - critical check for zero-click bots
+    # Exempt: touch users (mobile) and keyboard-only users (accessibility)
+    total_points = b.get("totalPoints", 0)
+    trajectory = b.get("trajectoryLength", 0)
+    touch_events = b.get("touchEvents", 0)
+    key_events = b.get("keyEvents", 0)
+    is_touch_user = touch_events > 0
+    is_keyboard_user = key_events > 0 and total_points == 0
+
+    if total_points == 0 and not is_touch_user and not is_keyboard_user:
+        detections.append(Detection(
+            ThreatCategory.BEHAVIORAL, 0.8, 0.9,
+            "Zero mouse, touch, or keyboard events recorded"
+        ))
+    elif total_points < 10 and not is_touch_user and not is_keyboard_user and trajectory < 30:
+        detections.append(Detection(
+            ThreatCategory.BEHAVIORAL, 0.6, 0.7,
+            "Insufficient mouse movement before interaction",
+            {"totalPoints": total_points, "trajectoryLength": trajectory}
+        ))
+
     # Velocity variance
     vel_var = b.get("velocityVariance", 1)
-    trajectory = b.get("trajectoryLength", 0)
     if vel_var < 0.02 and trajectory > 50:
         detections.append(Detection(
             ThreatCategory.BEHAVIORAL, 0.6, 0.6,

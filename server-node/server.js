@@ -213,13 +213,13 @@ const AUTOMATION_UA_PATTERNS = [
 const WEIGHTS = {
   vision_ai: 0.15,
   headless: 0.15,
-  automation: 0.10,
+  automation: 0.08,
   cdp: 0.12,
   behavioral: 0.18,
-  fingerprint: 0.10,
+  fingerprint: 0.08,
   rate_limit: 0.05,
-  datacenter: 0.10,
-  tor_vpn: 0.05,
+  datacenter: 0.07,
+  tor_vpn: 0.02,
   bot: 0.10
 };
 
@@ -235,6 +235,30 @@ function detectVisionAI(signals) {
   const detections = [];
   const b = signals.behavioral || {};
   const t = signals.temporal || {};
+
+  // Zero/minimal mouse movement - strong indicator of AI agent or programmatic click
+  // Exempt: touch users (mobile) and keyboard-only users (accessibility)
+  const totalPoints = b.totalPoints ?? 0;
+  const trajectory = b.trajectoryLength ?? 0;
+  const approachPts = b.approachPoints ?? 0;
+  const touchEvents = b.touchEvents ?? 0;
+  const keyEvents = b.keyEvents ?? 0;
+  const isTouchUser = touchEvents > 0;
+  const isKeyboardUser = keyEvents > 0 && totalPoints === 0;
+
+  if (totalPoints < 5 && trajectory < 10 && !isTouchUser && !isKeyboardUser) {
+    detections.push({
+      category: 'vision_ai', score: 0.9, confidence: 0.85,
+      reason: 'No mouse movement detected before click (AI agent pattern)'
+    });
+  }
+
+  if (approachPts === 0 && !isTouchUser && !isKeyboardUser) {
+    detections.push({
+      category: 'vision_ai', score: 0.7, confidence: 0.8,
+      reason: 'No approach trajectory to target'
+    });
+  }
 
   // PoW timing
   const pow = t.pow || {};
@@ -283,7 +307,6 @@ function detectVisionAI(signals) {
 
   // Exploration
   const exploration = b.explorationRatio ?? 0.3;
-  const trajectory = b.trajectoryLength ?? 0;
   if (exploration < 0.05 && trajectory > 50) {
     detections.push({
       category: 'vision_ai', score: 0.4, confidence: 0.4,
@@ -456,9 +479,29 @@ function detectBehavioral(signals) {
   const b = signals.behavioral || {};
   const t = signals.temporal || {};
 
+  // Insufficient mouse data - critical check for zero-click bots
+  // Exempt: touch users (mobile) and keyboard-only users (accessibility)
+  const totalPoints = b.totalPoints ?? 0;
+  const trajectory = b.trajectoryLength ?? 0;
+  const touchEvts = b.touchEvents ?? 0;
+  const keyEvts = b.keyEvents ?? 0;
+  const isTouchUsr = touchEvts > 0;
+  const isKbdUser = keyEvts > 0 && totalPoints === 0;
+
+  if (totalPoints === 0 && !isTouchUsr && !isKbdUser) {
+    detections.push({
+      category: 'behavioral', score: 0.8, confidence: 0.9,
+      reason: 'Zero mouse, touch, or keyboard events recorded'
+    });
+  } else if (totalPoints < 10 && !isTouchUsr && !isKbdUser && trajectory < 30) {
+    detections.push({
+      category: 'behavioral', score: 0.6, confidence: 0.7,
+      reason: 'Insufficient mouse movement before interaction'
+    });
+  }
+
   // Velocity variance
   const velVar = b.velocityVariance ?? 1;
-  const trajectory = b.trajectoryLength ?? 0;
   if (velVar < 0.02 && trajectory > 50) {
     detections.push({
       category: 'behavioral', score: 0.6, confidence: 0.6,
@@ -523,7 +566,6 @@ function detectBehavioral(signals) {
 
   // Direction changes
   const dirChanges = b.directionChanges ?? 10;
-  const totalPoints = b.totalPoints ?? 0;
   if (totalPoints > 50 && dirChanges < 3) {
     detections.push({
       category: 'behavioral', score: 0.4, confidence: 0.4,
