@@ -223,10 +223,13 @@ class PoWChallengeStore:
         # Mark solution as used
         self.used_solutions.add(solution_key)
 
+        # Calculate server-side elapsed time (un-spoofable)
+        server_elapsed = now - challenge["timestamp"]
+
         # Delete challenge (one-time use)
         del self.challenges[solution.challengeId]
 
-        return {"valid": True, "difficulty": challenge["difficulty"]}
+        return {"valid": True, "difficulty": challenge["difficulty"], "serverElapsed": server_elapsed}
 
     def _cleanup(self):
         now = int(time.time() * 1000)
@@ -280,8 +283,8 @@ WEIGHTS = {
     ThreatCategory.CDP: 0.12,
     ThreatCategory.BEHAVIORAL: 0.18,
     ThreatCategory.FINGERPRINT: 0.08,
-    ThreatCategory.RATE_LIMIT: 0.07,
-    ThreatCategory.BOT: 0.10,
+    ThreatCategory.RATE_LIMIT: 0.01,
+    ThreatCategory.BOT: 0.15,
 }
 
 
@@ -311,8 +314,8 @@ def detect_vision_ai(signals: Dict) -> List[Detection]:
     approach_pts = b.get("approachPoints", 0)
     touch_events = b.get("touchEvents", 0)
     key_events = b.get("keyEvents", 0)
-    is_touch_user = touch_events > 0
-    is_keyboard_user = key_events > 0 and total_points == 0
+    is_touch_user = touch_events >= 3
+    is_keyboard_user = key_events >= 2 and total_points == 0
 
     if total_points < 5 and trajectory < 10 and not is_touch_user and not is_keyboard_user:
         detections.append(Detection(
@@ -448,6 +451,22 @@ def detect_headless(signals: Dict, user_agent: str) -> List[Detection]:
             "Software WebGL renderer detected"
         ))
 
+    # Playwright-specific detection
+    playwright = env.get("playwright", {})
+    if playwright.get("detected"):
+        score_map = {
+            "playwright_globals": 0.95,
+            "webdriver_deleted": 0.8,
+            "webdriver_configurable": 0.7,
+            "chrome_runtime_missing": 0.6,
+        }
+        for sig in playwright.get("signals", []):
+            sig_score = score_map.get(sig, 0.7)
+            detections.append(Detection(
+                ThreatCategory.HEADLESS, sig_score, 0.8,
+                f"Playwright artifact detected: {sig}"
+            ))
+
     return detections
 
 
@@ -541,8 +560,8 @@ def detect_behavioral(signals: Dict) -> List[Detection]:
     trajectory = b.get("trajectoryLength", 0)
     touch_events = b.get("touchEvents", 0)
     key_events = b.get("keyEvents", 0)
-    is_touch_user = touch_events > 0
-    is_keyboard_user = key_events > 0 and total_points == 0
+    is_touch_user = touch_events >= 3
+    is_keyboard_user = key_events >= 2 and total_points == 0
 
     if total_points == 0 and not is_touch_user and not is_keyboard_user:
         detections.append(Detection(
@@ -804,10 +823,16 @@ def run_verification(
                 ThreatCategory.BOT, 0.7, 0.8,
                 f"PoW verification failed: {pow_result['reason']}"
             ))
+        elif pow_result.get("serverElapsed", 99999) < 1500:
+            # Server-side timing: challenge was solved too fast (un-spoofable)
+            detections.append(Detection(
+                ThreatCategory.BOT, 0.8, 0.85,
+                f"Challenge solved too fast ({pow_result['serverElapsed']}ms server-side)"
+            ))
     else:
-        # No PoW solution provided - suspicious
+        # No PoW solution provided - hard fail
         detections.append(Detection(
-            ThreatCategory.BOT, 0.5, 0.6,
+            ThreatCategory.BOT, 0.9, 0.95,
             "No PoW solution provided"
         ))
 

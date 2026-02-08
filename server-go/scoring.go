@@ -73,9 +73,10 @@ type PoWSolution struct {
 
 // PoWVerifyResult is the result of PoW verification
 type PoWVerifyResult struct {
-	Valid      bool
-	Reason     string
-	Difficulty int
+	Valid         bool
+	Reason        string
+	Difficulty    int
+	ServerElapsed int64
 }
 
 // PoWChallengeStore manages challenges
@@ -213,10 +214,10 @@ func NewScoringEngine(secretKey string) *ScoringEngine {
 			CategoryCDP:         0.12,
 			CategoryBehavioral:  0.18,
 			CategoryFingerprint: 0.08,
-			CategoryRateLimit:   0.05,
+			CategoryRateLimit:   0.01,
 			CategoryDatacenter:  0.07,
-			CategoryTorVPN:      0.02,
-			CategoryBot:         0.10,
+			CategoryTorVPN:      0.01,
+			CategoryBot:         0.15,
 		},
 		uaPatterns: compileUAPatterns(),
 	}
@@ -266,8 +267,40 @@ func compileUAPatterns() []*regexp.Regexp {
 }
 
 // VerifyWithHeaders performs full verification with HTTP headers
-func (e *ScoringEngine) VerifyWithHeaders(signals map[string]interface{}, ip, siteKey, userAgent string, headers map[string]string, ja3Hash string) *VerificationResult {
+func (e *ScoringEngine) VerifyWithHeaders(signals map[string]interface{}, ip, siteKey, userAgent string, headers map[string]string, ja3Hash string, powSolution ...*PoWSolution) *VerificationResult {
 	detections := make([]DetectionResult, 0)
+
+	// Verify PoW if provided
+	var pow *PoWSolution
+	if len(powSolution) > 0 {
+		pow = powSolution[0]
+	}
+	if pow != nil && pow.ChallengeID != "" {
+		powResult := e.VerifyPoWSolution(pow, siteKey)
+		if !powResult.Valid {
+			detections = append(detections, DetectionResult{
+				Category:   CategoryBot,
+				Score:      0.7,
+				Confidence: 0.8,
+				Reason:     "PoW verification failed: " + powResult.Reason,
+			})
+		} else if powResult.ServerElapsed < 1500 {
+			detections = append(detections, DetectionResult{
+				Category:   CategoryBot,
+				Score:      0.8,
+				Confidence: 0.85,
+				Reason:     fmt.Sprintf("Challenge solved too fast (%dms server-side)", powResult.ServerElapsed),
+			})
+		}
+	} else {
+		// No PoW solution provided - hard fail
+		detections = append(detections, DetectionResult{
+			Category:   CategoryBot,
+			Score:      0.9,
+			Confidence: 0.95,
+			Reason:     "No PoW solution provided",
+		})
+	}
 
 	// Behavioral detectors
 	detections = append(detections, e.detectVisionAI(signals)...)
@@ -332,7 +365,7 @@ func (e *ScoringEngine) VerifyWithHeaders(signals map[string]interface{}, ip, si
 
 // Verify performs full verification (backward compatible)
 func (e *ScoringEngine) Verify(signals map[string]interface{}, ip, siteKey, userAgent string) *VerificationResult {
-	return e.VerifyWithHeaders(signals, ip, siteKey, userAgent, nil, "")
+	return e.VerifyWithHeaders(signals, ip, siteKey, userAgent, nil, "", nil)
 }
 
 // GenerateChallenge creates a new PoW challenge (legacy)
@@ -450,10 +483,13 @@ func (e *ScoringEngine) VerifyPoWSolution(solution *PoWSolution, siteKey string)
 	// Mark solution as used
 	e.powStore.usedSolutions[solutionKey] = true
 
+	// Calculate server-side elapsed time (un-spoofable)
+	serverElapsed := now - challenge.Timestamp
+
 	// Delete challenge (one-time use)
 	delete(e.powStore.challenges, solution.ChallengeID)
 
-	return PoWVerifyResult{Valid: true, Difficulty: challenge.Difficulty}
+	return PoWVerifyResult{Valid: true, Difficulty: challenge.Difficulty, ServerElapsed: serverElapsed}
 }
 
 func formatInt64(n int64) string {
@@ -568,8 +604,8 @@ func (e *ScoringEngine) detectVisionAI(signals map[string]interface{}) []Detecti
 	approachPts := getFloat(behavioral, "approachPoints")
 	touchEventsAI := getFloat(behavioral, "touchEvents")
 	keyEventsAI := getFloat(behavioral, "keyEvents")
-	isTouchUser := touchEventsAI > 0
-	isKeyboardUser := keyEventsAI > 0 && totalPoints == 0
+	isTouchUser := touchEventsAI >= 3
+	isKeyboardUser := keyEventsAI >= 2 && totalPoints == 0
 
 	if totalPoints < 5 && trajectoryLen < 10 && !isTouchUser && !isKeyboardUser {
 		results = append(results, DetectionResult{
@@ -767,6 +803,33 @@ func (e *ScoringEngine) detectHeadless(signals map[string]interface{}, userAgent
 		}
 	}
 
+	// Playwright-specific detection
+	playwright := getMap(env, "playwright")
+	if getBool(playwright, "detected") {
+		scoreMap := map[string]float64{
+			"playwright_globals":      0.95,
+			"webdriver_deleted":       0.8,
+			"webdriver_configurable":  0.7,
+			"chrome_runtime_missing":  0.6,
+		}
+		if sigs, ok := playwright["signals"].([]interface{}); ok {
+			for _, s := range sigs {
+				if sig, ok := s.(string); ok {
+					sigScore := 0.7
+					if v, exists := scoreMap[sig]; exists {
+						sigScore = v
+					}
+					results = append(results, DetectionResult{
+						Category:   CategoryHeadless,
+						Score:      sigScore,
+						Confidence: 0.8,
+						Reason:     "Playwright artifact detected: " + sig,
+					})
+				}
+			}
+		}
+	}
+
 	return results
 }
 
@@ -916,8 +979,8 @@ func (e *ScoringEngine) detectBehavioral(signals map[string]interface{}) []Detec
 	trajectoryLength := getFloat(behavioral, "trajectoryLength")
 	touchEvents := getFloat(behavioral, "touchEvents")
 	keyEvents := getFloat(behavioral, "keyEvents")
-	isTouchUsr := touchEvents > 0
-	isKbdUsr := keyEvents > 0 && totalPoints == 0
+	isTouchUsr := touchEvents >= 3
+	isKbdUsr := keyEvents >= 2 && totalPoints == 0
 
 	if totalPoints == 0 && !isTouchUsr && !isKbdUsr {
 		results = append(results, DetectionResult{

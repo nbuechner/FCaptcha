@@ -103,7 +103,10 @@ const powChallengeStore = {
     // Delete challenge (one-time use)
     this.challenges.delete(challengeId);
 
-    return { valid: true, difficulty: challenge.difficulty };
+    // Calculate server-side elapsed time (un-spoofable)
+    const serverElapsed = Date.now() - challenge.createdAt;
+
+    return { valid: true, difficulty: challenge.difficulty, serverElapsed };
   },
 
   _cleanup() {
@@ -217,10 +220,10 @@ const WEIGHTS = {
   cdp: 0.12,
   behavioral: 0.18,
   fingerprint: 0.08,
-  rate_limit: 0.05,
+  rate_limit: 0.01,
   datacenter: 0.07,
-  tor_vpn: 0.02,
-  bot: 0.10
+  tor_vpn: 0.01,
+  bot: 0.15
 };
 
 // =============================================================================
@@ -243,8 +246,8 @@ function detectVisionAI(signals) {
   const approachPts = b.approachPoints ?? 0;
   const touchEvents = b.touchEvents ?? 0;
   const keyEvents = b.keyEvents ?? 0;
-  const isTouchUser = touchEvents > 0;
-  const isKeyboardUser = keyEvents > 0 && totalPoints === 0;
+  const isTouchUser = touchEvents >= 3;
+  const isKeyboardUser = keyEvents >= 2 && totalPoints === 0;
 
   if (totalPoints < 5 && trajectory < 10 && !isTouchUser && !isKeyboardUser) {
     detections.push({
@@ -388,6 +391,25 @@ function detectHeadless(signals, userAgent) {
     });
   }
 
+  // Playwright-specific detection
+  const playwright = env.playwright || {};
+  if (playwright.detected) {
+    const playwrightSignals = playwright.signals || [];
+    const scoreMap = {
+      playwright_globals: 0.95,
+      webdriver_deleted: 0.8,
+      webdriver_configurable: 0.7,
+      chrome_runtime_missing: 0.6,
+    };
+    for (const sig of playwrightSignals) {
+      const sigScore = scoreMap[sig] || 0.7;
+      detections.push({
+        category: 'headless', score: sigScore, confidence: 0.8,
+        reason: `Playwright artifact detected: ${sig}`
+      });
+    }
+  }
+
   return detections;
 }
 
@@ -485,8 +507,8 @@ function detectBehavioral(signals) {
   const trajectory = b.trajectoryLength ?? 0;
   const touchEvts = b.touchEvents ?? 0;
   const keyEvts = b.keyEvents ?? 0;
-  const isTouchUsr = touchEvts > 0;
-  const isKbdUser = keyEvts > 0 && totalPoints === 0;
+  const isTouchUsr = touchEvts >= 3;
+  const isKbdUser = keyEvts >= 2 && totalPoints === 0;
 
   if (totalPoints === 0 && !isTouchUsr && !isKbdUser) {
     detections.push({
@@ -777,13 +799,21 @@ function runVerification(signals, ip, siteKey, userAgent, headers = {}, ja3Hash 
         confidence: 0.8,
         reason: `PoW verification failed: ${powVerification.reason}`
       });
+    } else if (powVerification.serverElapsed < 1500) {
+      // Server-side timing: challenge was solved too fast (un-spoofable)
+      detections.push({
+        category: 'bot',
+        score: 0.8,
+        confidence: 0.85,
+        reason: `Challenge solved too fast (${powVerification.serverElapsed}ms server-side)`
+      });
     }
   } else {
-    // No PoW solution provided - suspicious
+    // No PoW solution provided - hard fail
     detections.push({
       category: 'bot',
-      score: 0.5,
-      confidence: 0.6,
+      score: 0.9,
+      confidence: 0.95,
       reason: 'No PoW solution provided'
     });
   }

@@ -659,6 +659,7 @@
         webdriver: this._detectWebdriver(),
         automationFlags: this._getAutomationFlags(),
         cdp: this._detectCDP(),
+        playwright: this._detectPlaywright(),
 
         // Browser fingerprints
         canvasHash: this._getCanvasHash(),
@@ -760,6 +761,38 @@
         // Permissions API
         permissionsAPI: !!navigator.permissions
       };
+    }
+
+    _detectPlaywright() {
+      try {
+        const signals = [];
+
+        // Check for Playwright window properties
+        const pwKeys = Object.getOwnPropertyNames(window).filter(k =>
+          k.startsWith('__pw') || k.startsWith('__playwright')
+        );
+        if (pwKeys.length > 0) signals.push('playwright_globals');
+
+        // Check if navigator.webdriver was deleted or reconfigured
+        const proto = Object.getPrototypeOf(navigator);
+        const desc = Object.getOwnPropertyDescriptor(proto, 'webdriver');
+        if (!desc) {
+          // Property was deleted from prototype — browsers always have it
+          signals.push('webdriver_deleted');
+        } else if (desc.configurable !== false) {
+          signals.push('webdriver_configurable');
+        }
+
+        // Check for missing chrome.runtime in Chrome UA
+        const isChrome = /Chrome\//.test(navigator.userAgent) && !/Edg\//.test(navigator.userAgent);
+        if (isChrome && window.chrome && !window.chrome.runtime) {
+          signals.push('chrome_runtime_missing');
+        }
+
+        return { detected: signals.length > 0, signals };
+      } catch (e) {
+        return { detected: false, signals: [] };
+      }
     }
 
     _detectCDP() {

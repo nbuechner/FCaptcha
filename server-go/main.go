@@ -62,6 +62,7 @@ func main() {
 	r.Post("/api/verify", verifyHandler(engine))
 	r.Post("/api/score", invisibleScoreHandler(engine))
 	r.Post("/api/token/verify", tokenVerifyHandler(engine))
+	r.Get("/api/pow/challenge", powChallengeHandler(engine))
 	r.Get("/api/challenge", challengeHandler(engine))
 
 	// Server
@@ -100,8 +101,9 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 
 // VerifyRequest is the request body for verification
 type VerifyRequest struct {
-	SiteKey string                 `json:"siteKey"`
-	Signals map[string]interface{} `json:"signals"`
+	SiteKey     string                 `json:"siteKey"`
+	Signals     map[string]interface{} `json:"signals"`
+	PowSolution *PoWSolution           `json:"powSolution,omitempty"`
 }
 
 // VerifyResponse is the response for verification
@@ -152,7 +154,7 @@ func verifyHandler(engine *ScoringEngine) http.HandlerFunc {
 		// JA3 hash (if provided by reverse proxy like nginx or Cloudflare)
 		ja3Hash := r.Header.Get("X-JA3-Hash")
 
-		result := engine.VerifyWithHeaders(req.Signals, ip, req.SiteKey, userAgent, headers, ja3Hash)
+		result := engine.VerifyWithHeaders(req.Signals, ip, req.SiteKey, userAgent, headers, ja3Hash, req.PowSolution)
 
 		// Convert detections
 		detections := make([]DetectionInfo, 0, len(result.Detections))
@@ -182,9 +184,10 @@ func verifyHandler(engine *ScoringEngine) http.HandlerFunc {
 
 // InvisibleScoreRequest for background scoring
 type InvisibleScoreRequest struct {
-	SiteKey string                 `json:"siteKey"`
-	Signals map[string]interface{} `json:"signals"`
-	Action  string                 `json:"action"`
+	SiteKey     string                 `json:"siteKey"`
+	Signals     map[string]interface{} `json:"signals"`
+	Action      string                 `json:"action"`
+	PowSolution *PoWSolution           `json:"powSolution,omitempty"`
 }
 
 func invisibleScoreHandler(engine *ScoringEngine) http.HandlerFunc {
@@ -202,7 +205,15 @@ func invisibleScoreHandler(engine *ScoringEngine) http.HandlerFunc {
 
 		userAgent := r.Header.Get("User-Agent")
 
-		result := engine.Verify(req.Signals, ip, req.SiteKey, userAgent)
+		// Collect headers for analysis
+		scoreHeaders := make(map[string]string)
+		for key, values := range r.Header {
+			if len(values) > 0 {
+				scoreHeaders[strings.ToLower(key)] = values[0]
+			}
+		}
+		ja3 := r.Header.Get("X-JA3-Hash")
+		result := engine.VerifyWithHeaders(req.Signals, ip, req.SiteKey, userAgent, scoreHeaders, ja3, req.PowSolution)
 
 		resp := map[string]interface{}{
 			"success":        result.Success,
@@ -244,6 +255,46 @@ func tokenVerifyHandler(engine *ScoringEngine) http.HandlerFunc {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(result)
+	}
+}
+
+// PoWChallengeResponse for the PoW challenge endpoint
+type PoWChallengeResponse struct {
+	ChallengeID string `json:"challengeId"`
+	Prefix      string `json:"prefix"`
+	Difficulty  int    `json:"difficulty"`
+	ExpiresAt   int64  `json:"expiresAt"`
+	Sig         string `json:"sig"`
+}
+
+func powChallengeHandler(engine *ScoringEngine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		siteKey := r.URL.Query().Get("siteKey")
+		if siteKey == "" {
+			siteKey = "default"
+		}
+
+		ip := r.RemoteAddr
+		if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+			ip = realIP
+		} else if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
+			parts := strings.Split(forwardedFor, ",")
+			ip = strings.TrimSpace(parts[0])
+		}
+
+		isDatacenter := IsDatacenterIP(ip)
+		challenge := engine.GeneratePoWChallenge(siteKey, ip, isDatacenter)
+
+		resp := PoWChallengeResponse{
+			ChallengeID: challenge.ID,
+			Prefix:      challenge.Prefix,
+			Difficulty:  challenge.Difficulty,
+			ExpiresAt:   challenge.ExpiresAt,
+			Sig:         challenge.Sig,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
 	}
 }
 

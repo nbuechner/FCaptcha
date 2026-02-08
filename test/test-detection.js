@@ -1018,6 +1018,232 @@ async function testAdvancedDetections() {
   assertScore(legitimateAdvancedResult, 0, 0.3, 'Legitimate advanced signals get low score');
 }
 
+async function testPlaywrightDetection() {
+  log('\n[Playwright Detection]', colors.cyan);
+
+  // Test playwright_globals signal
+  const playwrightGlobalsResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        environmental: {
+          playwright: {
+            detected: true,
+            signals: ['playwright_globals']
+          }
+        }
+      }
+    }
+  });
+  assertDetection(playwrightGlobalsResult, 'headless', true, 'Detects Playwright globals');
+
+  // Test webdriver_deleted signal
+  const webdriverDeletedResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        environmental: {
+          playwright: {
+            detected: true,
+            signals: ['webdriver_deleted', 'chrome_runtime_missing']
+          }
+        }
+      }
+    }
+  });
+  assertDetection(webdriverDeletedResult, 'headless', true, 'Detects deleted webdriver property');
+
+  // Test no playwright signals (should not detect)
+  const noPlaywrightResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 80, trajectoryLength: 350, velocityVariance: 0.8,
+          microTremorScore: 0.6, directionChanges: 15, mouseEventRate: 60,
+          interactionDuration: 1500, approachPoints: 12,
+        },
+        environmental: {
+          playwright: {
+            detected: false,
+            signals: []
+          },
+          automationFlags: {
+            chrome: true,
+            platform: 'MacIntel',
+            plugins: 5,
+          }
+        }
+      }
+    }
+  });
+  // Verify no playwright-related headless detections
+  const playwrightDetections = (noPlaywrightResult.detections || []).filter(
+    d => d.reason && d.reason.includes('Playwright')
+  );
+  if (playwrightDetections.length === 0) {
+    passed++;
+    log(`  ✓ No Playwright detection for clean browser`, colors.green);
+  } else {
+    failed++;
+    log(`  ✗ False Playwright detection on clean browser`, colors.red);
+  }
+}
+
+async function testMissingPoWHardFail() {
+  log('\n[Missing PoW Hard Fail]', colors.cyan);
+
+  // No PoW solution should result in a high score (blocked)
+  const noPoWResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 80, trajectoryLength: 350, velocityVariance: 0.8,
+          microTremorScore: 0.6, directionChanges: 15, mouseEventRate: 60,
+          interactionDuration: 1500, approachPoints: 12,
+        },
+        environmental: {
+          automationFlags: {
+            chrome: true,
+            platform: 'MacIntel',
+            plugins: 5,
+          }
+        }
+      }
+      // Note: no powSolution
+    }
+  });
+
+  // With bot weight 0.15 and score 0.9, the bot contribution alone is 0.135
+  // This should push overall score above 0.1 at minimum
+  const hasMissingPoW = (noPoWResult.detections || []).some(
+    d => d.reason && d.reason.includes('No PoW solution')
+  );
+  if (hasMissingPoW) {
+    passed++;
+    log(`  ✓ Missing PoW detected with hard-fail score (overall: ${noPoWResult.score.toFixed(3)})`, colors.green);
+  } else {
+    failed++;
+    log(`  ✗ Missing PoW not detected`, colors.red);
+  }
+
+  // Score should be higher than before (0.135 from bot alone)
+  assertScore(noPoWResult, 0.1, 1.0, 'Missing PoW raises score significantly');
+}
+
+async function testTightenedExemptions() {
+  log('\n[Tightened Accessibility Exemptions]', colors.cyan);
+
+  // touchEvents: 1 should NO LONGER exempt from mouse-movement checks
+  const singleTouchResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 0,
+          trajectoryLength: 0,
+          approachPoints: 0,
+          touchEvents: 1,
+          keyEvents: 0,
+        }
+      }
+    }
+  });
+  // With touchEvents=1 (below threshold of 3), mouse-movement detections should fire
+  assertDetection(singleTouchResult, 'vision_ai', true, 'touchEvents=1 no longer exempts from detection');
+  assertDetection(singleTouchResult, 'behavioral', true, 'touchEvents=1 no longer exempts behavioral');
+
+  // touchEvents: 3 should still exempt (legitimate touch user)
+  const legitimateTouchResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 0,
+          trajectoryLength: 0,
+          approachPoints: 0,
+          touchEvents: 3,
+          keyEvents: 0,
+          interactionDuration: 1500,
+        }
+      }
+    }
+  });
+  // With touchEvents=3, mouse-movement detections should NOT fire
+  assertDetection(legitimateTouchResult, 'vision_ai', false, 'touchEvents=3 still exempts vision_ai');
+  assertDetection(legitimateTouchResult, 'behavioral', false, 'touchEvents=3 still exempts behavioral');
+
+  // keyEvents: 1 should NO LONGER exempt
+  const singleKeyResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 0,
+          trajectoryLength: 0,
+          approachPoints: 0,
+          touchEvents: 0,
+          keyEvents: 1,
+        }
+      }
+    }
+  });
+  assertDetection(singleKeyResult, 'vision_ai', true, 'keyEvents=1 no longer exempts from detection');
+
+  // keyEvents: 2 with no mouse should still exempt (Tab + Enter)
+  const legitimateKbdResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 0,
+          trajectoryLength: 0,
+          approachPoints: 0,
+          touchEvents: 0,
+          keyEvents: 2,
+          interactionDuration: 1500,
+        }
+      }
+    }
+  });
+  assertDetection(legitimateKbdResult, 'vision_ai', false, 'keyEvents=2 with no mouse still exempts');
+}
+
 async function testProofOfWork() {
   log('\n[Proof of Work]', colors.cyan);
 
@@ -1217,6 +1443,9 @@ async function runTests() {
   await testVisionAIDetection();
   await testFormAnalysis();
   await testAdvancedDetections();
+  await testPlaywrightDetection();
+  await testMissingPoWHardFail();
+  await testTightenedExemptions();
   await testProofOfWork();
   await testTokenVerification();
   await testInvisibleMode();
