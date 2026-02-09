@@ -470,12 +470,19 @@
           intervals: [],
           lastKeyTime: null,
           inputWithoutKey: 0,
-          pasteCount: 0
+          pasteCount: 0,
+          dwellTimes: [],
+          rollovers: 0,
+          activeKeyCount: 0,
+          pendingKeydowns: []
         });
       }
 
       const stats = this.textareaStats.get(textareaId);
       const now = performance.now();
+
+      // Modifier keys excluded from dwell/rollover tracking
+      const isModifier = ['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'NumLock', 'ScrollLock'].includes(e.key);
 
       if (e.type === 'keydown') {
         stats.keydowns.push(now);
@@ -484,12 +491,35 @@
         }
         stats.lastKeyTime = now;
 
+        // Dwell/rollover tracking (non-modifier, non-repeat only)
+        if (!isModifier && !e.repeat) {
+          if (stats.activeKeyCount > 0) {
+            stats.rollovers++;
+          }
+          stats.activeKeyCount++;
+          stats.pendingKeydowns.push(now);
+        }
+
         // Limit memory
         if (stats.keydowns.length > 200) stats.keydowns.shift();
         if (stats.intervals.length > 200) stats.intervals.shift();
       } else if (e.type === 'keyup') {
         stats.keyups.push(now);
         if (stats.keyups.length > 200) stats.keyups.shift();
+
+        // Dwell time tracking (non-modifier only)
+        if (!isModifier && stats.activeKeyCount > 0) {
+          stats.activeKeyCount--;
+          if (stats.pendingKeydowns.length > 0) {
+            const keydownTime = stats.pendingKeydowns.shift();
+            const dwell = now - keydownTime;
+            if (dwell > 0 && dwell < 2000) {
+              stats.dwellTimes.push(dwell);
+              // Ring buffer: cap at 100
+              if (stats.dwellTimes.length > 100) stats.dwellTimes.shift();
+            }
+          }
+        }
       }
     }
 
@@ -569,7 +599,10 @@
           avgKeyInterval: avgInterval,
           keyIntervalVariance: intervalVariance,
           keydownUpRatio: stats.keyups.length > 0 ? stats.keydowns.length / stats.keyups.length : 0,
-          pasteCount: stats.pasteCount
+          pasteCount: stats.pasteCount,
+          intervals: stats.intervals.slice(-100),
+          dwellTimes: stats.dwellTimes.slice(-100),
+          rollovers: stats.rollovers
         };
       });
 

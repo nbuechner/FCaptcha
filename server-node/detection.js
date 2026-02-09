@@ -312,6 +312,249 @@ function checkJA3Fingerprint(ja3Hash) {
 }
 
 // =============================================================================
+// Statistical Utility Functions (Keystroke Cadence Analysis)
+// =============================================================================
+
+function mean(arr) {
+  if (arr.length === 0) return 0;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function stddev(arr) {
+  if (arr.length < 2) return 0;
+  const m = mean(arr);
+  const variance = arr.reduce((acc, v) => acc + (v - m) * (v - m), 0) / arr.length;
+  return Math.sqrt(variance);
+}
+
+function erf(x) {
+  // Abramowitz & Stegun approximation (max error ~1.5e-7)
+  const sign = x >= 0 ? 1 : -1;
+  x = Math.abs(x);
+  const t = 1.0 / (1.0 + 0.3275911 * x);
+  const y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return sign * y;
+}
+
+function normalCDF(x, mu, sigma) {
+  if (sigma <= 0) return x >= mu ? 1.0 : 0.0;
+  return 0.5 * (1.0 + erf((x - mu) / (sigma * Math.SQRT2)));
+}
+
+function ksTestStatistic(samples, cdfFn) {
+  const n = samples.length;
+  if (n === 0) return 0;
+  const sorted = [...samples].sort((a, b) => a - b);
+  let maxD = 0;
+  for (let i = 0; i < n; i++) {
+    const empirical = (i + 1) / n;
+    const theoretical = cdfFn(sorted[i]);
+    const d1 = Math.abs(empirical - theoretical);
+    const d2 = Math.abs((i / n) - theoretical);
+    maxD = Math.max(maxD, d1, d2);
+  }
+  return maxD;
+}
+
+function shannonEntropy(arr, bins) {
+  if (arr.length === 0) return 0;
+  const min = Math.min(...arr);
+  const max = Math.max(...arr);
+  if (max === min) return 0;
+  const binWidth = (max - min) / bins;
+  const counts = new Array(bins).fill(0);
+  for (const v of arr) {
+    let idx = Math.floor((v - min) / binWidth);
+    if (idx >= bins) idx = bins - 1;
+    counts[idx]++;
+  }
+  const n = arr.length;
+  let entropy = 0;
+  for (const c of counts) {
+    if (c > 0) {
+      const p = c / n;
+      entropy -= p * Math.log2(p);
+    }
+  }
+  return entropy;
+}
+
+function lag1Autocorrelation(arr) {
+  if (arr.length < 3) return 0;
+  const n = arr.length - 1;
+  const x = arr.slice(0, n);
+  const y = arr.slice(1);
+  const mx = mean(x);
+  const my = mean(y);
+  let num = 0, dx2 = 0, dy2 = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = x[i] - mx;
+    const dy = y[i] - my;
+    num += dx * dy;
+    dx2 += dx * dx;
+    dy2 += dy * dy;
+  }
+  const denom = Math.sqrt(dx2 * dy2);
+  if (denom === 0) return 0;
+  return num / denom;
+}
+
+// =============================================================================
+// Keystroke Cadence Analysis
+// =============================================================================
+
+function analyzeKeystrokeCadence(stats) {
+  const keyCount = stats.keyCount || 0;
+  const intervals = stats.intervals || [];
+  const dwellTimes = stats.dwellTimes || [];
+  const rollovers = stats.rollovers || 0;
+
+  // Gate on minimum data
+  if (keyCount < 20 || intervals.length < 15) return null;
+
+  const metrics = {};
+  let totalWeight = 0;
+  let weightedSum = 0;
+  let activeMetricCount = 0;
+
+  // 1. Dwell Variance (weight 0.15)
+  if (dwellTimes.length >= 10) {
+    const dSd = stddev(dwellTimes);
+    let score;
+    if (dSd < 3) score = 0;
+    else if (dSd < 10) score = 0.35 * (dSd - 3) / 7;
+    else if (dSd < 20) score = 0.35 + 0.65 * (dSd - 10) / 10;
+    else score = 1.0;
+    metrics.dwellVariance = score;
+    totalWeight += 0.15;
+    weightedSum += score * 0.15;
+    activeMetricCount++;
+  }
+
+  // 2. Log-Normal Fit (weight 0.20)
+  if (intervals.length >= 15) {
+    const logIntervals = intervals.filter(v => v > 0).map(v => Math.log(v));
+    if (logIntervals.length >= 10) {
+      const mu = mean(logIntervals);
+      const sigma = stddev(logIntervals);
+      const D = ksTestStatistic(logIntervals, (x) => normalCDF(x, mu, sigma));
+      // Critical value at α=0.10: 1.22 / sqrt(n)
+      const critical = 1.22 / Math.sqrt(logIntervals.length);
+      let score;
+      if (D <= critical * 0.8) score = 1.0;
+      else if (D <= critical) score = 0.7;
+      else if (D <= critical * 1.5) score = 0.3;
+      else score = 0;
+      metrics.logNormalFit = score;
+      totalWeight += 0.20;
+      weightedSum += score * 0.20;
+      activeMetricCount++;
+    }
+  }
+
+  // 3. Uniformity Detection (weight 0.15)
+  if (intervals.length >= 15) {
+    const minI = Math.min(...intervals);
+    const maxI = Math.max(...intervals);
+    if (maxI > minI) {
+      const D = ksTestStatistic(intervals, (x) => (x - minI) / (maxI - minI));
+      // Low D = looks uniform = bot-like
+      let score;
+      if (D < 0.05) score = 0;
+      else if (D < 0.1) score = 0.3;
+      else if (D < 0.15) score = 0.6;
+      else score = 1.0;
+      metrics.uniformity = score;
+      totalWeight += 0.15;
+      weightedSum += score * 0.15;
+      activeMetricCount++;
+    }
+  }
+
+  // 4. Lag-1 Autocorrelation (weight 0.15)
+  if (intervals.length >= 15) {
+    const r = Math.abs(lag1Autocorrelation(intervals));
+    let score;
+    if (r < 0.02) score = 0.1;
+    else if (r < 0.1) score = 0.1 + 0.4 * (r - 0.02) / 0.08;
+    else if (r < 0.2) score = 0.5 + 0.4 * (r - 0.1) / 0.1;
+    else if (r <= 0.4) score = 0.9;
+    else if (r <= 0.6) score = 0.9 - 0.4 * (r - 0.4) / 0.2;
+    else score = 0.5;
+    metrics.autocorrelation = score;
+    totalWeight += 0.15;
+    weightedSum += score * 0.15;
+    activeMetricCount++;
+  }
+
+  // 5. Burst Regularity (weight 0.10)
+  const burstGaps = [];
+  for (let i = 0; i < intervals.length; i++) {
+    if (intervals[i] > 300) burstGaps.push(intervals[i]);
+  }
+  if (burstGaps.length >= 3) {
+    const burstMean = mean(burstGaps);
+    const burstSd = stddev(burstGaps);
+    const cv = burstMean > 0 ? burstSd / burstMean : 0;
+    let score;
+    if (cv < 0.1) score = 0.1;
+    else if (cv < 0.3) score = 0.1 + 0.9 * (cv - 0.1) / 0.2;
+    else score = 1.0;
+    metrics.burstRegularity = score;
+    totalWeight += 0.10;
+    weightedSum += score * 0.10;
+    activeMetricCount++;
+  }
+
+  // 6. Shannon Entropy (weight 0.15)
+  if (intervals.length >= 15) {
+    const H = shannonEntropy(intervals, 10);
+    // Bell curve scoring: peak around H≈2.5
+    let score;
+    if (H < 0.5) score = 0.1;
+    else if (H < 1.5) score = 0.1 + 0.5 * (H - 0.5);
+    else if (H < 2.0) score = 0.6 + 0.4 * (H - 1.5) / 0.5;
+    else if (H <= 3.0) score = 1.0;
+    else if (H <= 3.3) score = 0.7;
+    else score = 0.4;
+    metrics.entropy = score;
+    totalWeight += 0.15;
+    weightedSum += score * 0.15;
+    activeMetricCount++;
+  }
+
+  // 7. Rollover Rate (weight 0.10)
+  if (keyCount >= 30) {
+    const rate = rollovers / keyCount;
+    let score;
+    if (rate === 0) score = 0.5;
+    else if (rate < 0.05) score = 0.5 + 0.3 * (rate / 0.05);
+    else if (rate < 0.15) score = 0.8 + 0.2 * ((rate - 0.05) / 0.1);
+    else score = 1.0;
+    metrics.rolloverRate = score;
+    totalWeight += 0.10;
+    weightedSum += score * 0.10;
+    activeMetricCount++;
+  }
+
+  if (totalWeight === 0) return null;
+
+  const humanScore = weightedSum / totalWeight;
+  const botScore = 1.0 - humanScore;
+
+  // Only emit detection when botScore > 0.55
+  if (botScore <= 0.55) return null;
+
+  return {
+    category: 'bot',
+    score: botScore * 0.7,
+    confidence: Math.min(0.7, activeMetricCount / 7),
+    reason: 'Keystroke cadence analysis indicates non-human typing pattern',
+    details: { metrics, cadenceHumanScore: humanScore }
+  };
+}
+
+// =============================================================================
 // Form Interaction Analysis (Credential Stuffing & Spam Detection)
 // =============================================================================
 
@@ -424,6 +667,12 @@ function analyzeFormInteraction(formAnalysis) {
           confidence: 0.8,
           reason: `Textarea "${fieldId}" has ${stats.contentLength} chars but no keyboard events (DOM manipulation)`
         });
+      }
+
+      // Keystroke cadence analysis
+      const cadenceResult = analyzeKeystrokeCadence(stats);
+      if (cadenceResult) {
+        detections.push(cadenceResult);
       }
     }
   }

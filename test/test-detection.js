@@ -666,6 +666,234 @@ async function testFormAnalysis() {
   assertScore(legitimateResult, 0, 0.3, 'Legitimate form submission gets low score');
 }
 
+async function testKeystrokeCadence() {
+  log('\n[Keystroke Cadence Analysis]', colors.cyan);
+
+  // Generate realistic log-normal intervals for human typing
+  function generateHumanIntervals(n) {
+    const intervals = [];
+    // Simulate log-normal distribution with mu≈4.8 (~120ms median), sigma≈0.4
+    const mu = 4.8, sigma = 0.4;
+    // Use seeded pseudo-random for reproducibility
+    let seed = 42;
+    function rand() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+    for (let i = 0; i < n; i++) {
+      // Box-Muller transform
+      const u1 = rand() || 0.001;
+      const u2 = rand() || 0.001;
+      const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+      const val = Math.exp(mu + sigma * z);
+      intervals.push(Math.max(40, Math.min(500, val)));
+    }
+    return intervals;
+  }
+
+  // a) Human cadence - should NOT increase score
+  const humanIntervals = generateHumanIntervals(35);
+  const humanDwellTimes = [];
+  { let s = 42; function r() { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; }
+    for (let i = 0; i < 30; i++) humanDwellTimes.push(25 + r() * 50); }
+
+  const humanCadenceResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 80, trajectoryLength: 350, velocityVariance: 0.8,
+          microTremorScore: 0.6, directionChanges: 15, mouseEventRate: 60,
+          interactionDuration: 1500, approachPoints: 12,
+        },
+        formAnalysis: {
+          pageLoadToFirstInteraction: 1500,
+          submit: {
+            method: 'keyboard',
+            timeSincePageLoad: 5000,
+            eventsBeforeSubmit: 40,
+            hadTriggerEvent: true
+          },
+          textareaKeyboard: {
+            message: {
+              keyCount: 40, avgKeyInterval: 130, keyIntervalVariance: 3500,
+              keydownUpRatio: 1.0, pasteCount: 0,
+              intervals: humanIntervals,
+              dwellTimes: humanDwellTimes,
+              rollovers: 8
+            }
+          }
+        },
+        environmental: {
+          automationFlags: { chrome: true, platform: 'MacIntel', plugins: 5 }
+        }
+      }
+    }
+  });
+  assertScore(humanCadenceResult, 0, 0.3, 'Human cadence does NOT increase score');
+
+  // b) Constant-timing bot - should increase score
+  const constantIntervals = Array(35).fill(100);
+  const constantDwellTimes = Array(30).fill(50);
+  const constantBotResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 80, trajectoryLength: 350, velocityVariance: 0.8,
+          microTremorScore: 0.6, directionChanges: 15, mouseEventRate: 60,
+          interactionDuration: 1500, approachPoints: 12,
+        },
+        formAnalysis: {
+          pageLoadToFirstInteraction: 1500,
+          submit: {
+            method: 'keyboard',
+            timeSincePageLoad: 5000,
+            eventsBeforeSubmit: 40,
+            hadTriggerEvent: true
+          },
+          textareaKeyboard: {
+            message: {
+              keyCount: 40, avgKeyInterval: 100, keyIntervalVariance: 5,
+              keydownUpRatio: 1.0, pasteCount: 0,
+              intervals: constantIntervals,
+              dwellTimes: constantDwellTimes,
+              rollovers: 0
+            }
+          }
+        },
+        environmental: {
+          automationFlags: { chrome: true, platform: 'MacIntel', plugins: 5 }
+        }
+      }
+    }
+  });
+  // Verify cadence detection is present (primary check)
+  const hasConstantCadence = (constantBotResult.detections || []).some(
+    d => d.reason && d.reason.includes('Keystroke cadence')
+  );
+  if (hasConstantCadence) {
+    passed++;
+    log(`  ✓ Constant-timing bot triggers cadence detection (score: ${constantBotResult.score.toFixed(3)})`, colors.green);
+  } else {
+    failed++;
+    log(`  ✗ Constant-timing bot did NOT trigger cadence detection`, colors.red);
+  }
+
+  // c) Alternating-jitter bot - should increase score
+  // Bot adds mechanical timing variation: alternating 80/120ms
+  const jitterIntervals = [];
+  for (let i = 0; i < 35; i++) jitterIntervals.push(i % 2 === 0 ? 80 : 120);
+  // Constant dwell times (no variance = bot)
+  const jitterDwellTimes = Array(30).fill(50);
+
+  const jitterBotResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 80, trajectoryLength: 350, velocityVariance: 0.8,
+          microTremorScore: 0.6, directionChanges: 15, mouseEventRate: 60,
+          interactionDuration: 1500, approachPoints: 12,
+        },
+        formAnalysis: {
+          pageLoadToFirstInteraction: 1500,
+          submit: {
+            method: 'keyboard',
+            timeSincePageLoad: 5000,
+            eventsBeforeSubmit: 40,
+            hadTriggerEvent: true
+          },
+          textareaKeyboard: {
+            message: {
+              keyCount: 40, avgKeyInterval: 100, keyIntervalVariance: 150,
+              keydownUpRatio: 1.0, pasteCount: 0,
+              intervals: jitterIntervals,
+              dwellTimes: jitterDwellTimes,
+              rollovers: 0
+            }
+          }
+        },
+        environmental: {
+          automationFlags: { chrome: true, platform: 'MacIntel', plugins: 5 }
+        }
+      }
+    }
+  });
+  const hasJitterCadence = (jitterBotResult.detections || []).some(
+    d => d.reason && d.reason.includes('Keystroke cadence')
+  );
+  if (hasJitterCadence) {
+    passed++;
+    log(`  ✓ Random-jitter bot triggers cadence detection`, colors.green);
+  } else {
+    failed++;
+    log(`  ✗ Random-jitter bot did NOT trigger cadence detection`, colors.red);
+  }
+
+  // d) Minimal data - should NOT trigger cadence
+  const minimalResult = await makeRequest('/api/verify', {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+    },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 80, trajectoryLength: 350, velocityVariance: 0.8,
+          microTremorScore: 0.6, directionChanges: 15, mouseEventRate: 60,
+          interactionDuration: 1500, approachPoints: 12,
+        },
+        formAnalysis: {
+          pageLoadToFirstInteraction: 1500,
+          submit: {
+            method: 'keyboard',
+            timeSincePageLoad: 5000,
+            eventsBeforeSubmit: 10,
+            hadTriggerEvent: true
+          },
+          textareaKeyboard: {
+            message: {
+              keyCount: 8, avgKeyInterval: 100, keyIntervalVariance: 5,
+              keydownUpRatio: 1.0, pasteCount: 0,
+              intervals: [100, 100, 100, 100, 100],
+              dwellTimes: [50, 50, 50, 50, 50],
+              rollovers: 0
+            }
+          }
+        },
+        environmental: {
+          automationFlags: { chrome: true, platform: 'MacIntel', plugins: 5 }
+        }
+      }
+    }
+  });
+  const hasMinimalCadence = (minimalResult.detections || []).some(
+    d => d.reason && d.reason.includes('Keystroke cadence')
+  );
+  if (!hasMinimalCadence) {
+    passed++;
+    log(`  ✓ Minimal data does NOT trigger cadence detection`, colors.green);
+  } else {
+    failed++;
+    log(`  ✗ Minimal data incorrectly triggered cadence detection`, colors.red);
+  }
+}
+
 async function testTokenVerification() {
   log('\n[Token Verification]', colors.cyan);
 
@@ -1447,6 +1675,7 @@ async function runTests() {
   await testMissingPoWHardFail();
   await testTightenedExemptions();
   await testProofOfWork();
+  await testKeystrokeCadence();
   await testTokenVerification();
   await testInvisibleMode();
 

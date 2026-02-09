@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"net"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -478,6 +480,387 @@ func (e *ScoringEngine) CheckJA3Fingerprint(ja3Hash string) []DetectionResult {
 }
 
 // =============================================================================
+// Statistical Utility Functions (Keystroke Cadence Analysis)
+// =============================================================================
+
+func statMean(arr []float64) float64 {
+	if len(arr) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, v := range arr {
+		sum += v
+	}
+	return sum / float64(len(arr))
+}
+
+func statStddev(arr []float64) float64 {
+	if len(arr) < 2 {
+		return 0
+	}
+	m := statMean(arr)
+	variance := 0.0
+	for _, v := range arr {
+		d := v - m
+		variance += d * d
+	}
+	variance /= float64(len(arr))
+	return math.Sqrt(variance)
+}
+
+func statErf(x float64) float64 {
+	sign := 1.0
+	if x < 0 {
+		sign = -1.0
+	}
+	x = math.Abs(x)
+	t := 1.0 / (1.0 + 0.3275911*x)
+	y := 1.0 - (((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*math.Exp(-x*x)
+	return sign * y
+}
+
+func statNormalCDF(x, mu, sigma float64) float64 {
+	if sigma <= 0 {
+		if x >= mu {
+			return 1.0
+		}
+		return 0.0
+	}
+	return 0.5 * (1.0 + statErf((x-mu)/(sigma*math.Sqrt2)))
+}
+
+func statKSTestStatistic(samples []float64, cdfFn func(float64) float64) float64 {
+	n := len(samples)
+	if n == 0 {
+		return 0
+	}
+	sorted := make([]float64, n)
+	copy(sorted, samples)
+	sort.Float64s(sorted)
+	maxD := 0.0
+	for i := 0; i < n; i++ {
+		empirical := float64(i+1) / float64(n)
+		theoretical := cdfFn(sorted[i])
+		d1 := math.Abs(empirical - theoretical)
+		d2 := math.Abs(float64(i)/float64(n) - theoretical)
+		if d1 > maxD {
+			maxD = d1
+		}
+		if d2 > maxD {
+			maxD = d2
+		}
+	}
+	return maxD
+}
+
+func statShannonEntropy(arr []float64, bins int) float64 {
+	if len(arr) == 0 {
+		return 0
+	}
+	minV := arr[0]
+	maxV := arr[0]
+	for _, v := range arr {
+		if v < minV {
+			minV = v
+		}
+		if v > maxV {
+			maxV = v
+		}
+	}
+	if maxV == minV {
+		return 0
+	}
+	binWidth := (maxV - minV) / float64(bins)
+	counts := make([]int, bins)
+	for _, v := range arr {
+		idx := int((v - minV) / binWidth)
+		if idx >= bins {
+			idx = bins - 1
+		}
+		counts[idx]++
+	}
+	n := float64(len(arr))
+	entropy := 0.0
+	for _, c := range counts {
+		if c > 0 {
+			p := float64(c) / n
+			entropy -= p * math.Log2(p)
+		}
+	}
+	return entropy
+}
+
+func statLag1Autocorrelation(arr []float64) float64 {
+	if len(arr) < 3 {
+		return 0
+	}
+	n := len(arr) - 1
+	x := arr[:n]
+	y := arr[1:]
+	mx := statMean(x)
+	my := statMean(y)
+	num := 0.0
+	dx2 := 0.0
+	dy2 := 0.0
+	for i := 0; i < n; i++ {
+		dx := x[i] - mx
+		dy := y[i] - my
+		num += dx * dy
+		dx2 += dx * dx
+		dy2 += dy * dy
+	}
+	denom := math.Sqrt(dx2 * dy2)
+	if denom == 0 {
+		return 0
+	}
+	return num / denom
+}
+
+func getFloatSlice(m map[string]interface{}, key string) []float64 {
+	if m == nil {
+		return nil
+	}
+	arr, ok := m[key].([]interface{})
+	if !ok {
+		return nil
+	}
+	result := make([]float64, 0, len(arr))
+	for _, v := range arr {
+		switch val := v.(type) {
+		case float64:
+			result = append(result, val)
+		case int:
+			result = append(result, float64(val))
+		}
+	}
+	return result
+}
+
+// =============================================================================
+// Keystroke Cadence Analysis
+// =============================================================================
+
+func analyzeKeystrokeCadence(stats map[string]interface{}) *DetectionResult {
+	keyCount := int(getFloat(stats, "keyCount"))
+	intervals := getFloatSlice(stats, "intervals")
+	dwellTimes := getFloatSlice(stats, "dwellTimes")
+	rollovers := int(getFloat(stats, "rollovers"))
+
+	// Gate on minimum data
+	if keyCount < 20 || len(intervals) < 15 {
+		return nil
+	}
+
+	metrics := map[string]interface{}{}
+	totalWeight := 0.0
+	weightedSum := 0.0
+	activeMetricCount := 0
+
+	// 1. Dwell Variance (weight 0.15)
+	if len(dwellTimes) >= 10 {
+		dSd := statStddev(dwellTimes)
+		var score float64
+		if dSd < 3 {
+			score = 0
+		} else if dSd < 10 {
+			score = 0.35 * (dSd - 3) / 7
+		} else if dSd < 20 {
+			score = 0.35 + 0.65*(dSd-10)/10
+		} else {
+			score = 1.0
+		}
+		metrics["dwellVariance"] = score
+		totalWeight += 0.15
+		weightedSum += score * 0.15
+		activeMetricCount++
+	}
+
+	// 2. Log-Normal Fit (weight 0.20)
+	if len(intervals) >= 15 {
+		logIntervals := make([]float64, 0, len(intervals))
+		for _, v := range intervals {
+			if v > 0 {
+				logIntervals = append(logIntervals, math.Log(v))
+			}
+		}
+		if len(logIntervals) >= 10 {
+			mu := statMean(logIntervals)
+			sigma := statStddev(logIntervals)
+			D := statKSTestStatistic(logIntervals, func(x float64) float64 {
+				return statNormalCDF(x, mu, sigma)
+			})
+			critical := 1.22 / math.Sqrt(float64(len(logIntervals)))
+			var score float64
+			if D <= critical*0.8 {
+				score = 1.0
+			} else if D <= critical {
+				score = 0.7
+			} else if D <= critical*1.5 {
+				score = 0.3
+			} else {
+				score = 0
+			}
+			metrics["logNormalFit"] = score
+			totalWeight += 0.20
+			weightedSum += score * 0.20
+			activeMetricCount++
+		}
+	}
+
+	// 3. Uniformity Detection (weight 0.15)
+	if len(intervals) >= 15 {
+		minI := intervals[0]
+		maxI := intervals[0]
+		for _, v := range intervals {
+			if v < minI {
+				minI = v
+			}
+			if v > maxI {
+				maxI = v
+			}
+		}
+		if maxI > minI {
+			rangeI := maxI - minI
+			D := statKSTestStatistic(intervals, func(x float64) float64 {
+				return (x - minI) / rangeI
+			})
+			var score float64
+			if D < 0.05 {
+				score = 0
+			} else if D < 0.1 {
+				score = 0.3
+			} else if D < 0.15 {
+				score = 0.6
+			} else {
+				score = 1.0
+			}
+			metrics["uniformity"] = score
+			totalWeight += 0.15
+			weightedSum += score * 0.15
+			activeMetricCount++
+		}
+	}
+
+	// 4. Lag-1 Autocorrelation (weight 0.15)
+	if len(intervals) >= 15 {
+		r := math.Abs(statLag1Autocorrelation(intervals))
+		var score float64
+		if r < 0.02 {
+			score = 0.1
+		} else if r < 0.1 {
+			score = 0.1 + 0.4*(r-0.02)/0.08
+		} else if r < 0.2 {
+			score = 0.5 + 0.4*(r-0.1)/0.1
+		} else if r <= 0.4 {
+			score = 0.9
+		} else if r <= 0.6 {
+			score = 0.9 - 0.4*(r-0.4)/0.2
+		} else {
+			score = 0.5
+		}
+		metrics["autocorrelation"] = score
+		totalWeight += 0.15
+		weightedSum += score * 0.15
+		activeMetricCount++
+	}
+
+	// 5. Burst Regularity (weight 0.10)
+	burstGaps := make([]float64, 0)
+	for _, v := range intervals {
+		if v > 300 {
+			burstGaps = append(burstGaps, v)
+		}
+	}
+	if len(burstGaps) >= 3 {
+		burstMean := statMean(burstGaps)
+		burstSd := statStddev(burstGaps)
+		cv := 0.0
+		if burstMean > 0 {
+			cv = burstSd / burstMean
+		}
+		var score float64
+		if cv < 0.1 {
+			score = 0.1
+		} else if cv < 0.3 {
+			score = 0.1 + 0.9*(cv-0.1)/0.2
+		} else {
+			score = 1.0
+		}
+		metrics["burstRegularity"] = score
+		totalWeight += 0.10
+		weightedSum += score * 0.10
+		activeMetricCount++
+	}
+
+	// 6. Shannon Entropy (weight 0.15)
+	if len(intervals) >= 15 {
+		H := statShannonEntropy(intervals, 10)
+		var score float64
+		if H < 0.5 {
+			score = 0.1
+		} else if H < 1.5 {
+			score = 0.1 + 0.5*(H-0.5)
+		} else if H < 2.0 {
+			score = 0.6 + 0.4*(H-1.5)/0.5
+		} else if H <= 3.0 {
+			score = 1.0
+		} else if H <= 3.3 {
+			score = 0.7
+		} else {
+			score = 0.4
+		}
+		metrics["entropy"] = score
+		totalWeight += 0.15
+		weightedSum += score * 0.15
+		activeMetricCount++
+	}
+
+	// 7. Rollover Rate (weight 0.10)
+	if keyCount >= 30 {
+		rate := float64(rollovers) / float64(keyCount)
+		var score float64
+		if rate == 0 {
+			score = 0.5
+		} else if rate < 0.05 {
+			score = 0.5 + 0.3*(rate/0.05)
+		} else if rate < 0.15 {
+			score = 0.8 + 0.2*((rate-0.05)/0.1)
+		} else {
+			score = 1.0
+		}
+		metrics["rolloverRate"] = score
+		totalWeight += 0.10
+		weightedSum += score * 0.10
+		activeMetricCount++
+	}
+
+	if totalWeight == 0 {
+		return nil
+	}
+
+	humanScore := weightedSum / totalWeight
+	botScore := 1.0 - humanScore
+
+	// Only emit detection when botScore > 0.55
+	if botScore <= 0.55 {
+		return nil
+	}
+
+	confidence := float64(activeMetricCount) / 7.0
+	if confidence > 0.7 {
+		confidence = 0.7
+	}
+
+	return &DetectionResult{
+		Category:   CategoryBot,
+		Score:      botScore * 0.7,
+		Confidence: confidence,
+		Reason:     "Keystroke cadence analysis indicates non-human typing pattern",
+		Details:    map[string]interface{}{"metrics": metrics, "cadenceHumanScore": humanScore},
+	}
+}
+
+// =============================================================================
 // Form Interaction Analysis (Credential Stuffing & Spam Detection)
 // =============================================================================
 
@@ -598,6 +981,12 @@ func (e *ScoringEngine) AnalyzeFormInteraction(formAnalysis map[string]interface
 					Confidence: 0.5,
 					Reason:     fmt.Sprintf("Textarea %q has abnormal keydown/keyup ratio (%.2f)", fieldId, keydownUpRatio),
 				})
+			}
+
+			// Keystroke cadence analysis
+			cadenceResult := analyzeKeystrokeCadence(stats)
+			if cadenceResult != nil {
+				detections = append(detections, *cadenceResult)
 			}
 		}
 	}

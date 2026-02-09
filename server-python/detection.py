@@ -5,6 +5,7 @@ IP Reputation, Header Analysis, Browser Consistency, TLS Fingerprinting
 """
 
 import re
+import math
 import socket
 import ipaddress
 from typing import Dict, List, Any, Optional
@@ -310,6 +311,262 @@ def check_ja3_fingerprint(ja3_hash: Optional[str]) -> List[Dict]:
 
 
 # =============================================================================
+# Statistical Utility Functions (Keystroke Cadence Analysis)
+# =============================================================================
+
+def _mean(arr: List[float]) -> float:
+    if not arr:
+        return 0.0
+    return sum(arr) / len(arr)
+
+def _stddev(arr: List[float]) -> float:
+    if len(arr) < 2:
+        return 0.0
+    m = _mean(arr)
+    variance = sum((v - m) ** 2 for v in arr) / len(arr)
+    return math.sqrt(variance)
+
+def _erf(x: float) -> float:
+    """Abramowitz & Stegun approximation (max error ~1.5e-7)."""
+    sign = 1 if x >= 0 else -1
+    x = abs(x)
+    t = 1.0 / (1.0 + 0.3275911 * x)
+    y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * math.exp(-x * x)
+    return sign * y
+
+def _normal_cdf(x: float, mu: float, sigma: float) -> float:
+    if sigma <= 0:
+        return 1.0 if x >= mu else 0.0
+    return 0.5 * (1.0 + _erf((x - mu) / (sigma * math.sqrt(2))))
+
+def _ks_test_statistic(samples: List[float], cdf_fn) -> float:
+    n = len(samples)
+    if n == 0:
+        return 0.0
+    sorted_samples = sorted(samples)
+    max_d = 0.0
+    for i in range(n):
+        empirical = (i + 1) / n
+        theoretical = cdf_fn(sorted_samples[i])
+        d1 = abs(empirical - theoretical)
+        d2 = abs((i / n) - theoretical)
+        max_d = max(max_d, d1, d2)
+    return max_d
+
+def _shannon_entropy(arr: List[float], bins: int) -> float:
+    if not arr:
+        return 0.0
+    min_v = min(arr)
+    max_v = max(arr)
+    if max_v == min_v:
+        return 0.0
+    bin_width = (max_v - min_v) / bins
+    counts = [0] * bins
+    for v in arr:
+        idx = int((v - min_v) / bin_width)
+        if idx >= bins:
+            idx = bins - 1
+        counts[idx] += 1
+    n = len(arr)
+    entropy = 0.0
+    for c in counts:
+        if c > 0:
+            p = c / n
+            entropy -= p * math.log2(p)
+    return entropy
+
+def _lag1_autocorrelation(arr: List[float]) -> float:
+    if len(arr) < 3:
+        return 0.0
+    n = len(arr) - 1
+    x = arr[:n]
+    y = arr[1:]
+    mx = _mean(x)
+    my = _mean(y)
+    num = 0.0
+    dx2 = 0.0
+    dy2 = 0.0
+    for i in range(n):
+        dx = x[i] - mx
+        dy = y[i] - my
+        num += dx * dy
+        dx2 += dx * dx
+        dy2 += dy * dy
+    denom = math.sqrt(dx2 * dy2)
+    if denom == 0:
+        return 0.0
+    return num / denom
+
+
+# =============================================================================
+# Keystroke Cadence Analysis
+# =============================================================================
+
+def _analyze_keystroke_cadence(stats: Dict) -> Optional[Dict]:
+    """Analyze keystroke cadence using 7 statistical metrics."""
+    key_count = stats.get("keyCount", 0)
+    intervals = stats.get("intervals", [])
+    dwell_times = stats.get("dwellTimes", [])
+    rollovers = stats.get("rollovers", 0)
+
+    # Gate on minimum data
+    if key_count < 20 or len(intervals) < 15:
+        return None
+
+    metrics = {}
+    total_weight = 0.0
+    weighted_sum = 0.0
+    active_metric_count = 0
+
+    # 1. Dwell Variance (weight 0.15)
+    if len(dwell_times) >= 10:
+        d_sd = _stddev(dwell_times)
+        if d_sd < 3:
+            score = 0.0
+        elif d_sd < 10:
+            score = 0.35 * (d_sd - 3) / 7
+        elif d_sd < 20:
+            score = 0.35 + 0.65 * (d_sd - 10) / 10
+        else:
+            score = 1.0
+        metrics["dwellVariance"] = score
+        total_weight += 0.15
+        weighted_sum += score * 0.15
+        active_metric_count += 1
+
+    # 2. Log-Normal Fit (weight 0.20)
+    if len(intervals) >= 15:
+        log_intervals = [math.log(v) for v in intervals if v > 0]
+        if len(log_intervals) >= 10:
+            mu = _mean(log_intervals)
+            sigma = _stddev(log_intervals)
+            D = _ks_test_statistic(log_intervals, lambda x: _normal_cdf(x, mu, sigma))
+            critical = 1.22 / math.sqrt(len(log_intervals))
+            if D <= critical * 0.8:
+                score = 1.0
+            elif D <= critical:
+                score = 0.7
+            elif D <= critical * 1.5:
+                score = 0.3
+            else:
+                score = 0.0
+            metrics["logNormalFit"] = score
+            total_weight += 0.20
+            weighted_sum += score * 0.20
+            active_metric_count += 1
+
+    # 3. Uniformity Detection (weight 0.15)
+    if len(intervals) >= 15:
+        min_i = min(intervals)
+        max_i = max(intervals)
+        if max_i > min_i:
+            D = _ks_test_statistic(intervals, lambda x: (x - min_i) / (max_i - min_i))
+            if D < 0.05:
+                score = 0.0
+            elif D < 0.1:
+                score = 0.3
+            elif D < 0.15:
+                score = 0.6
+            else:
+                score = 1.0
+            metrics["uniformity"] = score
+            total_weight += 0.15
+            weighted_sum += score * 0.15
+            active_metric_count += 1
+
+    # 4. Lag-1 Autocorrelation (weight 0.15)
+    if len(intervals) >= 15:
+        r = abs(_lag1_autocorrelation(intervals))
+        if r < 0.02:
+            score = 0.1
+        elif r < 0.1:
+            score = 0.1 + 0.4 * (r - 0.02) / 0.08
+        elif r < 0.2:
+            score = 0.5 + 0.4 * (r - 0.1) / 0.1
+        elif r <= 0.4:
+            score = 0.9
+        elif r <= 0.6:
+            score = 0.9 - 0.4 * (r - 0.4) / 0.2
+        else:
+            score = 0.5
+        metrics["autocorrelation"] = score
+        total_weight += 0.15
+        weighted_sum += score * 0.15
+        active_metric_count += 1
+
+    # 5. Burst Regularity (weight 0.10)
+    burst_gaps = [v for v in intervals if v > 300]
+    if len(burst_gaps) >= 3:
+        burst_mean = _mean(burst_gaps)
+        burst_sd = _stddev(burst_gaps)
+        cv = burst_sd / burst_mean if burst_mean > 0 else 0.0
+        if cv < 0.1:
+            score = 0.1
+        elif cv < 0.3:
+            score = 0.1 + 0.9 * (cv - 0.1) / 0.2
+        else:
+            score = 1.0
+        metrics["burstRegularity"] = score
+        total_weight += 0.10
+        weighted_sum += score * 0.10
+        active_metric_count += 1
+
+    # 6. Shannon Entropy (weight 0.15)
+    if len(intervals) >= 15:
+        H = _shannon_entropy(intervals, 10)
+        if H < 0.5:
+            score = 0.1
+        elif H < 1.5:
+            score = 0.1 + 0.5 * (H - 0.5)
+        elif H < 2.0:
+            score = 0.6 + 0.4 * (H - 1.5) / 0.5
+        elif H <= 3.0:
+            score = 1.0
+        elif H <= 3.3:
+            score = 0.7
+        else:
+            score = 0.4
+        metrics["entropy"] = score
+        total_weight += 0.15
+        weighted_sum += score * 0.15
+        active_metric_count += 1
+
+    # 7. Rollover Rate (weight 0.10)
+    if key_count >= 30:
+        rate = rollovers / key_count
+        if rate == 0:
+            score = 0.5
+        elif rate < 0.05:
+            score = 0.5 + 0.3 * (rate / 0.05)
+        elif rate < 0.15:
+            score = 0.8 + 0.2 * ((rate - 0.05) / 0.1)
+        else:
+            score = 1.0
+        metrics["rolloverRate"] = score
+        total_weight += 0.10
+        weighted_sum += score * 0.10
+        active_metric_count += 1
+
+    if total_weight == 0:
+        return None
+
+    human_score = weighted_sum / total_weight
+    bot_score = 1.0 - human_score
+
+    # Only emit detection when botScore > 0.55
+    if bot_score <= 0.55:
+        return None
+
+    return {
+        "category": "bot",
+        "score": bot_score * 0.7,
+        "confidence": min(0.7, active_metric_count / 7),
+        "reason": "Keystroke cadence analysis indicates non-human typing pattern",
+        "details": {"metrics": metrics, "cadenceHumanScore": human_score}
+    }
+
+
+# =============================================================================
 # Form Interaction Analysis (Credential Stuffing & Spam Detection)
 # =============================================================================
 
@@ -415,6 +672,11 @@ def analyze_form_interaction(form_analysis: Optional[Dict]) -> List[Dict]:
                     "confidence": 0.5,
                     "reason": f'Textarea "{field_id}" has abnormal keydown/keyup ratio ({keydown_up_ratio:.2f})'
                 })
+
+            # Keystroke cadence analysis
+            cadence_result = _analyze_keystroke_cadence(stats)
+            if cadence_result:
+                detections.append(cadence_result)
 
     return detections
 
