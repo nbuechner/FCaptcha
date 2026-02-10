@@ -30,47 +30,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        if: vars.DOCKERHUB_USERNAME != ''
-        uses: docker/login-action@v3
-        with:
-          username: ${{ vars.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Extract version from tag
         id: version
         env:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          GHCR_TAGS="ghcr.io/${IMAGE_NAME}:latest"
-          HUB_TAGS="${IMAGE_NAME}:latest"
+          TAGS="ghcr.io/${IMAGE_NAME}:latest"
           if [[ "$REF_TYPE" == "tag" ]]; then
             VERSION="${REF_NAME#v}"
-            GHCR_TAGS="${GHCR_TAGS},ghcr.io/${IMAGE_NAME}:${VERSION}"
-            HUB_TAGS="${HUB_TAGS},${IMAGE_NAME}:${VERSION}"
+            TAGS="${TAGS},ghcr.io/${IMAGE_NAME}:${VERSION}"
           fi
-          echo "ghcr_tags=${GHCR_TAGS}" >> "$GITHUB_OUTPUT"
-          echo "hub_tags=${HUB_TAGS}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push to GHCR
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           file: docker/Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.version.outputs.ghcr_tags }}
+          tags: ${{ steps.version.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Build and push to Docker Hub
-        if: vars.DOCKERHUB_USERNAME != ''
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/Dockerfile
-          push: true
-          platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.version.outputs.hub_tags }}
-          cache-from: type=gha

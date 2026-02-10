@@ -7,7 +7,6 @@
 ![Python](https://img.shields.io/badge/Python-3.12+-3776AB?logo=python)
 ![Node](https://img.shields.io/badge/Node-20+-339933?logo=node.js)
 ![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?logo=docker)
-![Docker Hub](https://img.shields.io/docker/pulls/webdecoy/fcaptcha?logo=docker&label=Docker%20Hub)
 
 **[Try the Live Demo](https://webdecoy.com/product/fcaptcha-demo/)**
 
