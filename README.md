@@ -7,8 +7,12 @@
 ![Python](https://img.shields.io/badge/Python-3.12+-3776AB?logo=python)
 ![Node](https://img.shields.io/badge/Node-20+-339933?logo=node.js)
 ![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?logo=docker)
+![Docker Hub](https://img.shields.io/docker/pulls/webdecoy/fcaptcha?logo=docker&label=Docker%20Hub)
 
 **[Try the Live Demo](https://webdecoy.com/product/fcaptcha-demo/)**
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/WebDecoy/FCaptcha)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/template?referralCode=webdecoy&template=https://github.com/WebDecoy/FCaptcha)
 
 FCaptcha is a modern CAPTCHA system designed to detect everything: traditional bots, headless browsers, automation frameworks, CAPTCHA farms, and the new generation of vision-based AI agents.
 
@@ -44,6 +48,13 @@ With Redis (for distributed state):
 
 ```bash
 FCAPTCHA_SECRET=my-secret docker compose -f docker/docker-compose.yml up -d
+```
+
+Deploy to Fly.io:
+
+```bash
+fly launch --copy-config
+fly secrets set FCAPTCHA_SECRET=my-secret
 ```
 
 Build from source:

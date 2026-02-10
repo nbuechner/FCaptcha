@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: fcaptcha
+    runtime: docker
+    dockerfilePath: docker/Dockerfile
+    dockerContext: .
+    envVars:
+      - key: FCAPTCHA_SECRET
+        generateValue: true
+      - key: PORT
+        value: 3000
+    healthCheckPath: /health
