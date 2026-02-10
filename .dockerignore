@@ -1,0 +1,7 @@
+.git
+server-node/node_modules
+server-python/__pycache__
+server-go/server
+test/
+.github/
+*.md

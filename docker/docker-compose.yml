@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   fcaptcha:
+    image: ghcr.io/webdecoy/fcaptcha:latest
     build:
       context: ..
       dockerfile: docker/Dockerfile

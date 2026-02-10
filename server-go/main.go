@@ -57,6 +57,12 @@ func main() {
 		MaxAge:           300,
 	}))
 
+	// Static file serving (for Docker/standalone deployment)
+	r.Get("/fcaptcha.js", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "./static/fcaptcha.js")
+	})
+	r.Handle("/demo/*", http.StripPrefix("/demo/", http.FileServer(http.Dir("./static/demo"))))
+
 	// Routes
 	r.Get("/health", healthHandler)
 	r.Post("/api/verify", verifyHandler(engine))

@@ -6,6 +6,7 @@
 ![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go)
 ![Python](https://img.shields.io/badge/Python-3.12+-3776AB?logo=python)
 ![Node](https://img.shields.io/badge/Node-20+-339933?logo=node.js)
+![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?logo=docker)
 
 **[Try the Live Demo](https://webdecoy.com/product/fcaptcha-demo/)**
 
@@ -26,7 +27,33 @@ FCaptcha is a modern CAPTCHA system designed to detect everything: traditional b
 
 ## Quick Start
 
-### 1. Run the Server
+### Docker (recommended)
+
+One command to deploy:
+
+```bash
+docker run -d -p 3000:3000 -e FCAPTCHA_SECRET=my-secret ghcr.io/webdecoy/fcaptcha
+```
+
+This gives you:
+- API at `http://localhost:3000/api/*`
+- Client JS at `http://localhost:3000/fcaptcha.js`
+- Demo page at `http://localhost:3000/demo/`
+
+With Redis (for distributed state):
+
+```bash
+FCAPTCHA_SECRET=my-secret docker compose -f docker/docker-compose.yml up -d
+```
+
+Build from source:
+
+```bash
+docker build -f docker/Dockerfile -t fcaptcha .
+docker run -d -p 3000:3000 -e FCAPTCHA_SECRET=my-secret fcaptcha
+```
+
+### Run from Source
 
 Pick your language:
 
@@ -49,21 +76,6 @@ FCAPTCHA_SECRET=your-secret python server.py
 cd server-node
 npm install
 FCAPTCHA_SECRET=your-secret node server.js
-```
-
-**Docker (any language)**
-```bash
-# Go
-docker build -t fcaptcha server-go/
-docker run -p 3000:3000 -e FCAPTCHA_SECRET=your-secret fcaptcha
-
-# Python
-docker build -t fcaptcha server-python/
-docker run -p 3000:3000 -e FCAPTCHA_SECRET=your-secret fcaptcha
-
-# Node
-docker build -t fcaptcha server-node/
-docker run -p 3000:3000 -e FCAPTCHA_SECRET=your-secret fcaptcha
 ```
 
 ### 2. Add to Your Site
@@ -326,27 +338,28 @@ fcaptcha/
 ├── client/
 │   └── fcaptcha.js          # Client-side widget, signal collection, PoW Web Worker
 ├── server-go/
-│   ├── main.go              # Go HTTP server
+│   ├── main.go              # Go HTTP server + static file serving
 │   ├── scoring.go           # Scoring engine + PoW verification
 │   ├── detection.go         # IP reputation, header analysis, browser checks
-│   ├── go.mod
-│   └── Dockerfile
+│   └── go.mod
 ├── server-python/
 │   ├── server.py            # Python/FastAPI server + PoW
 │   ├── detection.py         # Detection modules
-│   ├── requirements.txt
-│   └── Dockerfile
+│   └── requirements.txt
 ├── server-node/
 │   ├── server.js            # Node.js/Express server + PoW
 │   ├── detection.js         # Detection modules
-│   ├── package.json
-│   └── Dockerfile
+│   └── package.json
 ├── test/
 │   └── test-detection.js    # Comprehensive test suite (50 tests)
 ├── demo/
 │   └── index.html           # Interactive demo page
 ├── docker/
-│   └── docker-compose.yml   # Docker compose for Go + Redis
+│   ├── Dockerfile           # Multi-stage build (Go binary + client + demo)
+│   └── docker-compose.yml   # Docker compose with Redis
+├── .github/workflows/
+│   └── docker-publish.yml   # GHCR publish on release
+├── .dockerignore
 ├── ARCHITECTURE.md          # Technical architecture documentation
 └── README.md
 ```
