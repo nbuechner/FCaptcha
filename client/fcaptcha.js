@@ -390,8 +390,9 @@
         avgAcceleration: 0, accelerationChanges: 0, microTremorScore: 0.5,
         straightLineRatio: 0, microMovements: 0, directionChanges: 0,
         eventDeltas: [], eventDeltaVariance: 0, mouseEventRate: 0,
-        scrollEvents: 0, keyEvents: 0, touchEvents: 0, focusEvents: 0,
-        clickData: null, interactionDuration: 0
+        scrollEvents: this.scrollEvents.length, keyEvents: this.keyEvents.length,
+        touchEvents: this.touchEvents.length, focusEvents: this.focusEvents.length,
+        clickData: this.clickData, interactionDuration: Date.now() - this.startTime
       };
     }
 

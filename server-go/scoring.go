@@ -604,7 +604,7 @@ func (e *ScoringEngine) detectVisionAI(signals map[string]interface{}) []Detecti
 	approachPts := getFloat(behavioral, "approachPoints")
 	touchEventsAI := getFloat(behavioral, "touchEvents")
 	keyEventsAI := getFloat(behavioral, "keyEvents")
-	isTouchUser := touchEventsAI >= 3
+	isTouchUser := touchEventsAI >= 1
 	isKeyboardUser := keyEventsAI >= 2 && totalPoints == 0
 
 	if totalPoints < 5 && trajectoryLen < 10 && !isTouchUser && !isKeyboardUser {
@@ -979,7 +979,7 @@ func (e *ScoringEngine) detectBehavioral(signals map[string]interface{}) []Detec
 	trajectoryLength := getFloat(behavioral, "trajectoryLength")
 	touchEvents := getFloat(behavioral, "touchEvents")
 	keyEvents := getFloat(behavioral, "keyEvents")
-	isTouchUsr := touchEvents >= 3
+	isTouchUsr := touchEvents >= 1
 	isKbdUsr := keyEvents >= 2 && totalPoints == 0
 
 	if totalPoints == 0 && !isTouchUsr && !isKbdUsr {

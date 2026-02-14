@@ -246,7 +246,7 @@ function detectVisionAI(signals) {
   const approachPts = b.approachPoints ?? 0;
   const touchEvents = b.touchEvents ?? 0;
   const keyEvents = b.keyEvents ?? 0;
-  const isTouchUser = touchEvents >= 3;
+  const isTouchUser = touchEvents >= 1;
   const isKeyboardUser = keyEvents >= 2 && totalPoints === 0;
 
   if (totalPoints < 5 && trajectory < 10 && !isTouchUser && !isKeyboardUser) {
@@ -507,7 +507,7 @@ function detectBehavioral(signals) {
   const trajectory = b.trajectoryLength ?? 0;
   const touchEvts = b.touchEvents ?? 0;
   const keyEvts = b.keyEvents ?? 0;
-  const isTouchUsr = touchEvts >= 3;
+  const isTouchUsr = touchEvts >= 1;
   const isKbdUser = keyEvts >= 2 && totalPoints === 0;
 
   if (totalPoints === 0 && !isTouchUsr && !isKbdUser) {

@@ -314,7 +314,7 @@ def detect_vision_ai(signals: Dict) -> List[Detection]:
     approach_pts = b.get("approachPoints", 0)
     touch_events = b.get("touchEvents", 0)
     key_events = b.get("keyEvents", 0)
-    is_touch_user = touch_events >= 3
+    is_touch_user = touch_events >= 1
     is_keyboard_user = key_events >= 2 and total_points == 0
 
     if total_points < 5 and trajectory < 10 and not is_touch_user and not is_keyboard_user:
@@ -560,7 +560,7 @@ def detect_behavioral(signals: Dict) -> List[Detection]:
     trajectory = b.get("trajectoryLength", 0)
     touch_events = b.get("touchEvents", 0)
     key_events = b.get("keyEvents", 0)
-    is_touch_user = touch_events >= 3
+    is_touch_user = touch_events >= 1
     is_keyboard_user = key_events >= 2 and total_points == 0
 
     if total_points == 0 and not is_touch_user and not is_keyboard_user:
