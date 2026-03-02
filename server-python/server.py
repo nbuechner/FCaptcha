@@ -40,17 +40,27 @@ class PoWSolution(BaseModel):
     challengeId: str
     nonce: int
     hash: str
+    signalsHash: Optional[str] = None
+
+class PowTiming(BaseModel):
+    duration: Optional[float] = None
+    iterations: Optional[int] = None
+    difficulty: Optional[int] = None
 
 class VerifyRequest(BaseModel):
     siteKey: str
     signals: Dict[str, Any]
+    signalsJson: Optional[str] = None
     powSolution: Optional[PoWSolution] = None
+    powTiming: Optional[PowTiming] = None
 
 class ScoreRequest(BaseModel):
     siteKey: str
     signals: Dict[str, Any]
+    signalsJson: Optional[str] = None
     action: str = ""
     powSolution: Optional[PoWSolution] = None
+    powTiming: Optional[PowTiming] = None
 
 class TokenVerifyRequest(BaseModel):
     token: str
@@ -134,6 +144,7 @@ class PoWChallengeStore:
     def generate(self, site_key: str, ip: str, is_datacenter: bool = False) -> Dict:
         import secrets
         challenge_id = secrets.token_hex(16)
+        nonce = secrets.token_hex(16)
         now = int(time.time() * 1000)
         expires_at = now + (5 * 60 * 1000)  # 5 minutes
 
@@ -157,6 +168,7 @@ class PoWChallengeStore:
             "difficulty": difficulty,
             "timestamp": now,
             "expiresAt": expires_at,
+            "nonce": nonce,
             "ip": ip
         }
 
@@ -169,7 +181,7 @@ class PoWChallengeStore:
             "difficulty": difficulty,
             "prefix": prefix
         }, sort_keys=True)
-        sig = hmac.new(SECRET_KEY.encode(), sig_data.encode(), hashlib.sha256).hexdigest()[:16]
+        sig = hmac.new(SECRET_KEY.encode(), sig_data.encode(), hashlib.sha256).hexdigest()
         challenge["sig"] = sig
 
         # Store challenge
@@ -184,10 +196,11 @@ class PoWChallengeStore:
             "prefix": prefix,
             "difficulty": difficulty,
             "expiresAt": expires_at,
+            "nonce": nonce,
             "sig": sig
         }
 
-    def verify(self, solution: PoWSolution, site_key: str) -> Dict:
+    def verify(self, solution: PoWSolution, site_key: str, signals_hash: str = None) -> Dict:
         if not solution or not solution.challengeId:
             return {"valid": False, "reason": "no_solution"}
 
@@ -208,8 +221,11 @@ class PoWChallengeStore:
         if solution_key in self.used_solutions:
             return {"valid": False, "reason": "solution_already_used"}
 
-        # Verify the hash
-        input_str = f"{challenge['prefix']}:{solution.nonce}"
+        # Verify the hash (with optional signalsHash binding)
+        if signals_hash:
+            input_str = f"{challenge['prefix']}:{signals_hash}:{solution.nonce}"
+        else:
+            input_str = f"{challenge['prefix']}:{solution.nonce}"
         expected_hash = hashlib.sha256(input_str.encode()).hexdigest()
 
         if solution.hash != expected_hash:
@@ -229,7 +245,7 @@ class PoWChallengeStore:
         # Delete challenge (one-time use)
         del self.challenges[solution.challengeId]
 
-        return {"valid": True, "difficulty": challenge["difficulty"], "serverElapsed": server_elapsed}
+        return {"valid": True, "difficulty": challenge["difficulty"], "serverElapsed": server_elapsed, "nonce": challenge.get("nonce")}
 
     def _cleanup(self):
         now = int(time.time() * 1000)
@@ -753,7 +769,7 @@ def generate_token(ip: str, site_key: str, score: float) -> str:
         "ip_hash": ip_hash
     }
     payload = json.dumps(data, sort_keys=True)
-    sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]
+    sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
     data["sig"] = sig
     return base64.urlsafe_b64encode(json.dumps(data).encode()).decode()
 
@@ -769,7 +785,7 @@ def verify_token(token: str, ip: str = None) -> Dict:
         sig = decoded.pop("sig", "")
         ip_hash = decoded.get("ip_hash", "")
         payload = json.dumps(decoded, sort_keys=True)
-        expected_sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]
+        expected_sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(sig, expected_sig):
             return {"valid": False, "reason": "invalid_signature"}
@@ -805,7 +821,9 @@ def run_verification(
     user_agent: str,
     headers: Dict[str, str] = None,
     ja3_hash: str = None,
-    pow_solution: PoWSolution = None
+    pow_solution: PoWSolution = None,
+    signals_json: str = None,
+    pow_timing: PowTiming = None
 ) -> Dict:
     from detection import (
         check_ip_reputation, analyze_headers,
@@ -815,15 +833,50 @@ def run_verification(
 
     detections = []
 
+    # Verify signal commitment (signalsJson hash must match powSolution.signalsHash)
+    client_signals_hash = pow_solution.signalsHash if pow_solution else None
+    if signals_json and client_signals_hash:
+        computed_hash = hashlib.sha256(signals_json.encode()).hexdigest()
+        if computed_hash != client_signals_hash:
+            detections.append(Detection(
+                ThreatCategory.BOT, 0.95, 0.95,
+                "Signals tampered after PoW (signalsHash mismatch)"
+            ))
+        # Use signalsJson as the canonical signals source
+        try:
+            signals = json.loads(signals_json)
+        except json.JSONDecodeError:
+            pass  # Fall back to parsed signals
+
+    # Inject powTiming into signals.temporal.pow for detection functions
+    if pow_timing:
+        if "temporal" not in signals:
+            signals["temporal"] = {}
+        signals["temporal"]["pow"] = {
+            "duration": pow_timing.duration,
+            "iterations": pow_timing.iterations,
+            "difficulty": pow_timing.difficulty
+        }
+
     # Verify PoW if provided
     if pow_solution:
-        pow_result = pow_store.verify(pow_solution, site_key)
+        pow_result = pow_store.verify(pow_solution, site_key, client_signals_hash)
         if not pow_result["valid"]:
             detections.append(Detection(
                 ThreatCategory.BOT, 0.7, 0.8,
                 f"PoW verification failed: {pow_result['reason']}"
             ))
-        elif pow_result.get("serverElapsed", 99999) < 1500:
+
+        # Verify challenge nonce binding
+        if pow_result["valid"] and pow_result.get("nonce"):
+            client_nonce = signals.get("meta", {}).get("challengeNonce")
+            if not client_nonce or client_nonce != pow_result["nonce"]:
+                detections.append(Detection(
+                    ThreatCategory.BOT, 0.9, 0.9,
+                    "Challenge nonce mismatch (signals not bound to challenge)"
+                ))
+
+        if pow_result["valid"] and pow_result.get("serverElapsed", 99999) < 1500:
             # Server-side timing: challenge was solved too fast (un-spoofable)
             detections.append(Detection(
                 ThreatCategory.BOT, 0.8, 0.85,
@@ -929,7 +982,7 @@ async def verify(req: VerifyRequest, request: Request):
     # Collect headers for analysis
     headers = {k.lower(): v for k, v in request.headers.items()}
 
-    result = run_verification(req.signals, ip, req.siteKey, user_agent, headers, ja3_hash, req.powSolution)
+    result = run_verification(req.signals, ip, req.siteKey, user_agent, headers, ja3_hash, req.powSolution, req.signalsJson, req.powTiming)
     return result
 
 
@@ -940,7 +993,7 @@ async def score(req: ScoreRequest, request: Request):
     ja3_hash = request.headers.get("X-JA3-Hash", "")
     headers = {k.lower(): v for k, v in request.headers.items()}
 
-    result = run_verification(req.signals, ip, req.siteKey, user_agent, headers, ja3_hash, req.powSolution)
+    result = run_verification(req.signals, ip, req.siteKey, user_agent, headers, ja3_hash, req.powSolution, req.signalsJson, req.powTiming)
     return {
         "success": result["success"],
         "score": result["score"],

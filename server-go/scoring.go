@@ -60,6 +60,7 @@ type PoWChallenge struct {
 	Difficulty int    `json:"difficulty"`
 	Timestamp  int64  `json:"timestamp"`
 	ExpiresAt  int64  `json:"expiresAt"`
+	Nonce      string `json:"nonce"`
 	Sig        string `json:"sig"`
 	IP         string `json:"-"` // Not sent to client
 }
@@ -69,6 +70,7 @@ type PoWSolution struct {
 	ChallengeID string `json:"challengeId"`
 	Nonce       int    `json:"nonce"`
 	Hash        string `json:"hash"`
+	SignalsHash string `json:"signalsHash,omitempty"`
 }
 
 // PoWVerifyResult is the result of PoW verification
@@ -77,6 +79,7 @@ type PoWVerifyResult struct {
 	Reason        string
 	Difficulty    int
 	ServerElapsed int64
+	Nonce         string
 }
 
 // PoWChallengeStore manages challenges
@@ -276,7 +279,7 @@ func (e *ScoringEngine) VerifyWithHeaders(signals map[string]interface{}, ip, si
 		pow = powSolution[0]
 	}
 	if pow != nil && pow.ChallengeID != "" {
-		powResult := e.VerifyPoWSolution(pow, siteKey)
+		powResult := e.VerifyPoWSolution(pow, siteKey, pow.SignalsHash)
 		if !powResult.Valid {
 			detections = append(detections, DetectionResult{
 				Category:   CategoryBot,
@@ -284,7 +287,25 @@ func (e *ScoringEngine) VerifyWithHeaders(signals map[string]interface{}, ip, si
 				Confidence: 0.8,
 				Reason:     "PoW verification failed: " + powResult.Reason,
 			})
-		} else if powResult.ServerElapsed < 1500 {
+		}
+
+		// Verify challenge nonce binding
+		if powResult.Valid && powResult.Nonce != "" {
+			clientNonce := ""
+			if meta := getMap(signals, "meta"); meta != nil {
+				clientNonce = getString(meta, "challengeNonce")
+			}
+			if clientNonce == "" || clientNonce != powResult.Nonce {
+				detections = append(detections, DetectionResult{
+					Category:   CategoryBot,
+					Score:      0.9,
+					Confidence: 0.9,
+					Reason:     "Challenge nonce mismatch (signals not bound to challenge)",
+				})
+			}
+		}
+
+		if powResult.Valid && powResult.ServerElapsed < 1500 {
 			detections = append(detections, DetectionResult{
 				Category:   CategoryBot,
 				Score:      0.8,
@@ -386,6 +407,10 @@ func (e *ScoringEngine) GeneratePoWChallenge(siteKey, ip string, isDatacenter bo
 	rand.Read(id)
 	challengeID := hex.EncodeToString(id)
 
+	nonceBytes := make([]byte, 16)
+	rand.Read(nonceBytes)
+	nonce := hex.EncodeToString(nonceBytes)
+
 	now := time.Now().UnixMilli()
 	expiresAt := now + (5 * 60 * 1000) // 5 minutes
 
@@ -411,6 +436,7 @@ func (e *ScoringEngine) GeneratePoWChallenge(siteKey, ip string, isDatacenter bo
 		Difficulty: difficulty,
 		Timestamp:  now,
 		ExpiresAt:  expiresAt,
+		Nonce:      nonce,
 		IP:         ip,
 	}
 
@@ -425,7 +451,7 @@ func (e *ScoringEngine) GeneratePoWChallenge(siteKey, ip string, isDatacenter bo
 	})
 	h := hmac.New(sha256.New, []byte(e.secretKey))
 	h.Write(sigData)
-	challenge.Sig = hex.EncodeToString(h.Sum(nil))[:16]
+	challenge.Sig = hex.EncodeToString(h.Sum(nil))
 
 	// Store challenge
 	e.powStore.mu.Lock()
@@ -436,7 +462,8 @@ func (e *ScoringEngine) GeneratePoWChallenge(siteKey, ip string, isDatacenter bo
 }
 
 // VerifyPoWSolution verifies a PoW solution from the client
-func (e *ScoringEngine) VerifyPoWSolution(solution *PoWSolution, siteKey string) PoWVerifyResult {
+// signalsHash is optional; if provided, it's included in the PoW input for signal binding
+func (e *ScoringEngine) VerifyPoWSolution(solution *PoWSolution, siteKey string, signalsHash ...string) PoWVerifyResult {
 	if solution == nil || solution.ChallengeID == "" {
 		return PoWVerifyResult{Valid: false, Reason: "no_solution"}
 	}
@@ -465,8 +492,13 @@ func (e *ScoringEngine) VerifyPoWSolution(solution *PoWSolution, siteKey string)
 		return PoWVerifyResult{Valid: false, Reason: "solution_already_used"}
 	}
 
-	// Verify the hash
-	input := challenge.Prefix + ":" + formatInt(solution.Nonce)
+	// Verify the hash (with optional signalsHash binding)
+	var input string
+	if len(signalsHash) > 0 && signalsHash[0] != "" {
+		input = challenge.Prefix + ":" + signalsHash[0] + ":" + formatInt(solution.Nonce)
+	} else {
+		input = challenge.Prefix + ":" + formatInt(solution.Nonce)
+	}
 	expectedHash := sha256.Sum256([]byte(input))
 	expectedHashHex := hex.EncodeToString(expectedHash[:])
 
@@ -489,7 +521,7 @@ func (e *ScoringEngine) VerifyPoWSolution(solution *PoWSolution, siteKey string)
 	// Delete challenge (one-time use)
 	delete(e.powStore.challenges, solution.ChallengeID)
 
-	return PoWVerifyResult{Valid: true, Difficulty: challenge.Difficulty, ServerElapsed: serverElapsed}
+	return PoWVerifyResult{Valid: true, Difficulty: challenge.Difficulty, ServerElapsed: serverElapsed, Nonce: challenge.Nonce}
 }
 
 func formatInt64(n int64) string {
@@ -1262,7 +1294,7 @@ func (e *ScoringEngine) generateToken(ip, siteKey string, score float64) string 
 func (e *ScoringEngine) computeSignature(payload []byte) string {
 	h := hmac.New(sha256.New, []byte(e.secretKey))
 	h.Write(payload)
-	return hex.EncodeToString(h.Sum(nil))[:16]
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // ============================================================

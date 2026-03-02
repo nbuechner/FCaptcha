@@ -1563,6 +1563,17 @@
   }
 
   // ============================================================
+  // SHA-256 Helper (main thread)
+  // ============================================================
+
+  async function sha256(message) {
+    const msgBuffer = new TextEncoder().encode(message);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  // ============================================================
   // Proof of Work Manager (Web Worker based)
   // ============================================================
 
@@ -1587,16 +1598,19 @@
         }
 
         self.onmessage = async function(e) {
-          const { prefix, difficulty, batchSize = 10000 } = e.data;
+          const { prefix, difficulty, signalsHash, batchSize = 10000 } = e.data;
           const target = '0'.repeat(difficulty);
           let nonce = 0;
           let iterations = 0;
           const startTime = performance.now();
 
+          // Build PoW input: include signalsHash if provided
+          const inputPrefix = signalsHash ? prefix + ':' + signalsHash : prefix;
+
           while (true) {
             // Process in batches for better responsiveness
             for (let i = 0; i < batchSize; i++) {
-              const hash = await sha256(prefix + ':' + nonce);
+              const hash = await sha256(inputPrefix + ':' + nonce);
               iterations++;
 
               if (hash.startsWith(target)) {
@@ -1660,8 +1674,17 @@
       return this.challenge;
     }
 
-    // Start solving in background
+    // Start solving in background (legacy - solve without signals binding)
     async startSolving(siteKey) {
+      return this._solve(siteKey, null);
+    }
+
+    // Solve with signals hash bound into PoW input
+    async solveWithSignalsHash(siteKey, signalsHash) {
+      return this._solve(siteKey, signalsHash);
+    }
+
+    async _solve(siteKey, signalsHash) {
       if (this.solving) return this.solvePromise;
 
       // Fetch challenge if not already fetched
@@ -1684,6 +1707,7 @@
               iterations: e.data.iterations,
               duration: e.data.duration,
               difficulty: this.challenge.difficulty,
+              signalsHash: signalsHash || null,
               local: this.challenge.local || false
             };
             this.solving = false;
@@ -1698,10 +1722,11 @@
           reject(e);
         };
 
-        // Start solving
+        // Start solving with optional signalsHash
         this.worker.postMessage({
           prefix: this.challenge.prefix,
           difficulty: this.challenge.difficulty,
+          signalsHash: signalsHash || null,
           batchSize: 5000
         });
       });
@@ -1851,15 +1876,15 @@
     _init() {
       this._createWidget();
       this._attachListeners();
-      // Start PoW in background immediately
-      this._startPoW();
+      // Fetch challenge eagerly but defer solving until signals are collected
+      this._fetchChallenge();
     }
 
-    async _startPoW() {
+    async _fetchChallenge() {
       try {
-        await this.powManager.startSolving(this.options.siteKey);
+        await this.powManager.fetchChallenge(this.options.siteKey);
       } catch (e) {
-        console.warn('PoW background solving failed:', e);
+        console.warn('PoW challenge fetch failed:', e);
       }
     }
 
@@ -1977,31 +2002,22 @@
       this.label.textContent = 'Verifying...';
 
       try {
-        // Collect signals (sync and async in parallel)
+        // Step 1: Collect all signals (sync and async in parallel)
         const behavioralData = this.behavioral.analyze();
         const clickData = this.behavioral.analyzeClick(e.clientX, e.clientY, rect);
         const envData = this.environmental.collect();
 
-        // Collect async data in parallel
         const [rafData, asyncEnvData] = await Promise.all([
           this.environmental.measureRAFConsistency(),
           this.environmental.collectAsync()
         ]);
 
-        // Wait for PoW solution (should already be solved in background)
-        const powSolution = await this.powManager.getSolution(this.options.siteKey);
-
-        // Also collect legacy PoW timing for temporal signals
-        this.temporal.powResult = {
-          duration: powSolution.duration,
-          iterations: powSolution.iterations,
-          difficulty: powSolution.difficulty
-        };
+        // Collect temporal data WITHOUT pow timing (not yet solved)
         const temporalData = this.temporal.collect(clickTime);
 
-        // Get form interaction analysis
         const formAnalysis = getFormAnalyzer().analyze();
 
+        // Step 2: Build signals object (without pow timing)
         const signals = {
           behavioral: { ...behavioralData, ...clickData },
           environmental: { ...envData, rafConsistency: rafData, ...asyncEnvData },
@@ -2010,6 +2026,7 @@
           meta: {
             widgetId: this.id,
             siteKey: this.options.siteKey,
+            challengeNonce: this.powManager.challenge?.nonce || null,
             timestamp: Date.now(),
             userAgent: navigator.userAgent,
             screenSize: `${screen.width}x${screen.height}`,
@@ -2018,7 +2035,22 @@
           }
         };
 
-        const result = await this._verify(signals, powSolution);
+        // Step 3: Serialize and hash signals for PoW binding
+        const signalsJson = JSON.stringify(signals);
+        const signalsHash = await sha256(signalsJson);
+
+        // Step 4: Solve PoW with signalsHash bound
+        const powSolution = await this.powManager.solveWithSignalsHash(this.options.siteKey, signalsHash);
+
+        // Step 5: Build powTiming separately (not part of committed signals)
+        const powTiming = {
+          duration: powSolution.duration,
+          iterations: powSolution.iterations,
+          difficulty: powSolution.difficulty
+        };
+
+        // Step 6: Submit with signals, signalsJson, signalsHash, and powTiming
+        const result = await this._verify(signals, powSolution, signalsJson, signalsHash, powTiming);
 
         if (result.success) {
           this._showSuccess(result.token);
@@ -2031,7 +2063,7 @@
       }
     }
 
-    async _verify(signals, powSolution = null) {
+    async _verify(signals, powSolution = null, signalsJson = null, signalsHash = null, powTiming = null) {
       if (!FCaptcha.serverUrl) {
         return this._clientSideVerify(signals);
       }
@@ -2043,11 +2075,14 @@
           body: JSON.stringify({
             siteKey: this.options.siteKey,
             signals,
+            signalsJson: signalsJson || null,
             powSolution: powSolution ? {
               challengeId: powSolution.challengeId,
               nonce: powSolution.nonce,
-              hash: powSolution.hash
-            } : null
+              hash: powSolution.hash,
+              signalsHash: signalsHash || null
+            } : null,
+            powTiming: powTiming || null
           })
         });
         return await response.json();
@@ -2140,8 +2175,8 @@
       this.checkbox.setAttribute('aria-checked', 'false');
       this.spinner.style.display = 'none';
       this.label.textContent = "I'm not a robot";
-      // Start new PoW in background
-      this._startPoW();
+      // Fetch new challenge in background
+      this._fetchChallenge();
     }
   }
 
@@ -2183,15 +2218,15 @@
 
       if (this.options.autoScore) this._attachToForms();
 
-      // Start PoW in background
-      this._startPoW();
+      // Fetch challenge eagerly but defer solving until signals are collected
+      this._fetchChallenge();
     }
 
-    async _startPoW() {
+    async _fetchChallenge() {
       try {
-        await this.powManager.startSolving(this.options.siteKey);
+        await this.powManager.fetchChallenge(this.options.siteKey);
       } catch (e) {
-        console.warn('PoW background solving failed:', e);
+        console.warn('PoW challenge fetch failed:', e);
       }
     }
 
@@ -2260,29 +2295,21 @@
         await new Promise(r => setTimeout(r, this.options.minCollectionTime - elapsed));
       }
 
+      // Step 1: Collect all signals
       const behavioralData = this.behavioral.analyze();
       const envData = this.environmental.collect();
 
-      // Wait for PoW solution (should already be solved in background)
-      const powSolution = await this.powManager.getSolution(this.options.siteKey);
-
-      // Also collect legacy PoW timing for temporal signals
-      this.temporal.powResult = {
-        duration: powSolution.duration,
-        iterations: powSolution.iterations,
-        difficulty: powSolution.difficulty
-      };
+      // Collect temporal data WITHOUT pow timing (not yet solved)
       const temporalData = this.temporal.collect(Date.now());
 
-      // Collect async environmental data in parallel
       const [rafData, asyncEnvData] = await Promise.all([
         this.environmental.measureRAFConsistency(),
         this.environmental.collectAsync()
       ]);
 
-      // Get form interaction analysis
       const formAnalysis = getFormAnalyzer().analyze();
 
+      // Step 2: Build signals object (without pow timing)
       const signals = {
         behavioral: behavioralData,
         environmental: { ...envData, rafConsistency: rafData, ...asyncEnvData },
@@ -2292,6 +2319,7 @@
           sessionId: this.id,
           siteKey: this.options.siteKey,
           action,
+          challengeNonce: this.powManager.challenge?.nonce || null,
           timestamp: Date.now(),
           userAgent: navigator.userAgent,
           screenSize: `${screen.width}x${screen.height}`,
@@ -2302,12 +2330,27 @@
         }
       };
 
-      const result = await this._score(signals, action, powSolution);
+      // Step 3: Serialize and hash signals for PoW binding
+      const signalsJson = JSON.stringify(signals);
+      const signalsHash = await sha256(signalsJson);
+
+      // Step 4: Solve PoW with signalsHash bound
+      const powSolution = await this.powManager.solveWithSignalsHash(this.options.siteKey, signalsHash);
+
+      // Step 5: Build powTiming separately
+      const powTiming = {
+        duration: powSolution.duration,
+        iterations: powSolution.iterations,
+        difficulty: powSolution.difficulty
+      };
+
+      // Step 6: Submit
+      const result = await this._score(signals, action, powSolution, signalsJson, signalsHash, powTiming);
       this.lastScore = { ...result, timestamp: Date.now() };
       return result;
     }
 
-    async _score(signals, action, powSolution = null) {
+    async _score(signals, action, powSolution = null, signalsJson = null, signalsHash = null, powTiming = null) {
       const url = this.options.serverUrl || FCaptcha.serverUrl;
 
       if (!url) return this._clientSideScore(signals);
@@ -2319,12 +2362,15 @@
           body: JSON.stringify({
             siteKey: this.options.siteKey,
             signals,
+            signalsJson: signalsJson || null,
             action,
             powSolution: powSolution ? {
               challengeId: powSolution.challengeId,
               nonce: powSolution.nonce,
-              hash: powSolution.hash
-            } : null
+              hash: powSolution.hash,
+              signalsHash: signalsHash || null
+            } : null,
+            powTiming: powTiming || null
           })
         });
         return await response.json();

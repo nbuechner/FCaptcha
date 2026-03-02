@@ -28,6 +28,7 @@ const powChallengeStore = {
   // Generate a new challenge
   generate(siteKey, ip, difficulty = 4) {
     const challengeId = crypto.randomBytes(16).toString('hex');
+    const nonce = crypto.randomBytes(16).toString('hex');
     const timestamp = Date.now();
     const expiresAt = timestamp + (5 * 60 * 1000); // 5 minutes
 
@@ -38,14 +39,14 @@ const powChallengeStore = {
       timestamp,
       expiresAt,
       difficulty,
+      nonce,
       prefix: `${challengeId}:${timestamp}:${difficulty}`
     };
 
     // Sign the challenge
     challengeData.sig = crypto.createHmac('sha256', SECRET_KEY)
       .update(JSON.stringify(challengeData))
-      .digest('hex')
-      .slice(0, 16);
+      .digest('hex');
 
     // Store challenge
     this.challenges.set(challengeId, {
@@ -60,8 +61,8 @@ const powChallengeStore = {
     return challengeData;
   },
 
-  // Verify a PoW solution
-  verify(challengeId, nonce, hash, siteKey) {
+  // Verify a PoW solution (signalsHash is optional for backward compat)
+  verify(challengeId, nonce, hash, siteKey, signalsHash = null) {
     const challenge = this.challenges.get(challengeId);
 
     if (!challenge) {
@@ -83,8 +84,10 @@ const powChallengeStore = {
       return { valid: false, reason: 'solution_already_used' };
     }
 
-    // Verify the hash
-    const input = `${challenge.prefix}:${nonce}`;
+    // Verify the hash (with optional signalsHash binding)
+    const input = signalsHash
+      ? `${challenge.prefix}:${signalsHash}:${nonce}`
+      : `${challenge.prefix}:${nonce}`;
     const expectedHash = crypto.createHash('sha256').update(input).digest('hex');
 
     if (hash !== expectedHash) {
@@ -106,7 +109,7 @@ const powChallengeStore = {
     // Calculate server-side elapsed time (un-spoofable)
     const serverElapsed = Date.now() - challenge.createdAt;
 
-    return { valid: true, difficulty: challenge.difficulty, serverElapsed };
+    return { valid: true, difficulty: challenge.difficulty, serverElapsed, nonce: challenge.nonce };
   },
 
   _cleanup() {
@@ -717,7 +720,7 @@ function generateToken(ip, siteKey, score) {
   };
 
   const payload = JSON.stringify(data, Object.keys(data).sort());
-  data.sig = crypto.createHmac('sha256', SECRET_KEY).update(payload).digest('hex').slice(0, 16);
+  data.sig = crypto.createHmac('sha256', SECRET_KEY).update(payload).digest('hex');
 
   return Buffer.from(JSON.stringify(data)).toString('base64url');
 }
@@ -735,7 +738,7 @@ function verifyToken(token, ip = null) {
     delete decoded.sig;
 
     const payload = JSON.stringify(decoded, Object.keys(decoded).sort());
-    const expectedSig = crypto.createHmac('sha256', SECRET_KEY).update(payload).digest('hex').slice(0, 16);
+    const expectedSig = crypto.createHmac('sha256', SECRET_KEY).update(payload).digest('hex');
 
     if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))) {
       return { valid: false, reason: 'invalid_signature' };
@@ -769,16 +772,34 @@ function verifyToken(token, ip = null) {
   }
 }
 
-function runVerification(signals, ip, siteKey, userAgent, headers = {}, ja3Hash = null, powSolution = null) {
-  const detections = [
-    ...detectVisionAI(signals),
-    ...detectHeadless(signals, userAgent),
-    ...detectAutomation(signals),
-    ...detectCDP(signals),
-    ...detectBehavioral(signals),
-    ...detectFingerprint(signals, ip, siteKey),
-    ...detectRateAbuse(ip, siteKey)
-  ];
+function runVerification(signals, ip, siteKey, userAgent, headers = {}, ja3Hash = null, powSolution = null, signalsJson = null, powTiming = null) {
+  const detections = [];
+
+  // Verify signal commitment (signalsJson hash must match powSolution.signalsHash)
+  const clientSignalsHash = powSolution?.signalsHash || null;
+  if (signalsJson && clientSignalsHash) {
+    const computedHash = crypto.createHash('sha256').update(signalsJson).digest('hex');
+    if (computedHash !== clientSignalsHash) {
+      detections.push({
+        category: 'bot',
+        score: 0.95,
+        confidence: 0.95,
+        reason: 'Signals tampered after PoW (signalsHash mismatch)'
+      });
+    }
+    // Use signalsJson as the canonical signals source
+    try {
+      signals = JSON.parse(signalsJson);
+    } catch (e) {
+      // Fall back to parsed signals if signalsJson is invalid
+    }
+  }
+
+  // Inject powTiming into signals.temporal.pow for detection functions
+  if (powTiming) {
+    if (!signals.temporal) signals.temporal = {};
+    signals.temporal.pow = powTiming;
+  }
 
   // Verify PoW if provided
   let powValid = false;
@@ -788,7 +809,8 @@ function runVerification(signals, ip, siteKey, userAgent, headers = {}, ja3Hash 
       powSolution.challengeId,
       powSolution.nonce,
       powSolution.hash,
-      siteKey
+      siteKey,
+      clientSignalsHash
     );
     powValid = powVerification.valid;
 
@@ -799,7 +821,22 @@ function runVerification(signals, ip, siteKey, userAgent, headers = {}, ja3Hash 
         confidence: 0.8,
         reason: `PoW verification failed: ${powVerification.reason}`
       });
-    } else if (powVerification.serverElapsed < 1500) {
+    }
+
+    // Verify challenge nonce binding
+    if (powValid && powVerification.nonce) {
+      const clientNonce = signals.meta?.challengeNonce;
+      if (!clientNonce || clientNonce !== powVerification.nonce) {
+        detections.push({
+          category: 'bot',
+          score: 0.9,
+          confidence: 0.9,
+          reason: 'Challenge nonce mismatch (signals not bound to challenge)'
+        });
+      }
+    }
+
+    if (powValid && powVerification.serverElapsed < 1500) {
       // Server-side timing: challenge was solved too fast (un-spoofable)
       detections.push({
         category: 'bot',
@@ -817,6 +854,17 @@ function runVerification(signals, ip, siteKey, userAgent, headers = {}, ja3Hash 
       reason: 'No PoW solution provided'
     });
   }
+
+  // Run behavioral detectors
+  detections.push(
+    ...detectVisionAI(signals),
+    ...detectHeadless(signals, userAgent),
+    ...detectAutomation(signals),
+    ...detectCDP(signals),
+    ...detectBehavioral(signals),
+    ...detectFingerprint(signals, ip, siteKey),
+    ...detectRateAbuse(ip, siteKey)
+  );
 
   // Add IP reputation check (async but we'll use sync version for simplicity)
   if (detection.isDatacenterIP(ip)) {
@@ -884,7 +932,7 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/api/verify', (req, res) => {
-  const { siteKey, signals, powSolution } = req.body;
+  const { siteKey, signals, powSolution, signalsJson, powTiming } = req.body;
   let ip = req.headers['x-real-ip'] || '';
   if (!ip) {
     const forwarded = req.headers['x-forwarded-for'];
@@ -903,12 +951,12 @@ app.post('/api/verify', (req, res) => {
     headers[key.toLowerCase()] = Array.isArray(value) ? value[0] : value;
   }
 
-  const result = runVerification(signals, ip, siteKey, userAgent, headers, ja3Hash, powSolution);
+  const result = runVerification(signals, ip, siteKey, userAgent, headers, ja3Hash, powSolution, signalsJson, powTiming);
   res.json(result);
 });
 
 app.post('/api/score', (req, res) => {
-  const { siteKey, signals, action, powSolution } = req.body;
+  const { siteKey, signals, action, powSolution, signalsJson, powTiming } = req.body;
   let ip = req.headers['x-real-ip'] || '';
   if (!ip) {
     const forwarded = req.headers['x-forwarded-for'];
@@ -926,7 +974,7 @@ app.post('/api/score', (req, res) => {
     headers[key.toLowerCase()] = Array.isArray(value) ? value[0] : value;
   }
 
-  const result = runVerification(signals, ip, siteKey, userAgent, headers, ja3Hash, powSolution);
+  const result = runVerification(signals, ip, siteKey, userAgent, headers, ja3Hash, powSolution, signalsJson, powTiming);
   res.json({
     success: result.success,
     score: result.score,
@@ -992,6 +1040,7 @@ app.get('/api/pow/challenge', (req, res) => {
     prefix: challenge.prefix,
     difficulty: challenge.difficulty,
     expiresAt: challenge.expiresAt,
+    nonce: challenge.nonce,
     sig: challenge.sig
   });
 });

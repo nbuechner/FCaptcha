@@ -1475,49 +1475,72 @@ async function testTightenedExemptions() {
 async function testProofOfWork() {
   log('\n[Proof of Work]', colors.cyan);
 
+  const { createHash } = await import('crypto');
+
+  // Helper: solve PoW with optional signalsHash
+  function solvePoW(prefix, difficulty, signalsHash = null) {
+    const target = '0'.repeat(difficulty);
+    const inputPrefix = signalsHash ? `${prefix}:${signalsHash}` : prefix;
+    let nonce = 0;
+    const maxIterations = 10000000;
+
+    while (nonce < maxIterations) {
+      const input = `${inputPrefix}:${nonce}`;
+      const hash = createHash('sha256').update(input).digest('hex');
+      if (hash.startsWith(target)) {
+        return { nonce, hash };
+      }
+      nonce++;
+    }
+    return null;
+  }
+
   // Test getting a PoW challenge
   try {
     const challengeResponse = await fetch(`${SERVER_URL}/api/pow/challenge?siteKey=test`);
     const challenge = await challengeResponse.json();
 
-    if (challenge.challengeId && challenge.prefix && challenge.difficulty) {
+    if (challenge.challengeId && challenge.prefix && challenge.difficulty && challenge.nonce) {
       passed++;
-      log(`  ✓ PoW challenge endpoint works (difficulty: ${challenge.difficulty})`, colors.green);
+      log(`  ✓ PoW challenge endpoint works (difficulty: ${challenge.difficulty}, has nonce)`, colors.green);
     } else {
       failed++;
-      log(`  ✗ PoW challenge response missing fields`, colors.red);
+      log(`  ✗ PoW challenge response missing fields (need challengeId, prefix, difficulty, nonce)`, colors.red);
       return;
     }
 
-    // Solve the PoW challenge
-    const { createHash } = await import('crypto');
-    const target = '0'.repeat(challenge.difficulty);
-    let nonce = 0;
-    let hash = '';
-    const maxIterations = 10000000; // Safety limit
-
-    log(`    Solving PoW (difficulty: ${challenge.difficulty})...`, colors.dim);
-
-    while (nonce < maxIterations) {
-      const input = `${challenge.prefix}:${nonce}`;
-      hash = createHash('sha256').update(input).digest('hex');
-
-      if (hash.startsWith(target)) {
-        break;
+    // Build signals with challengeNonce
+    const signals = {
+      behavioral: {
+        totalPoints: 80, trajectoryLength: 350,
+        interactionDuration: 1500, velocityVariance: 0.8,
+        microTremorScore: 0.6, directionChanges: 15,
+        mouseEventRate: 60, approachPoints: 12,
+      },
+      environmental: {
+        automationFlags: { chrome: true, platform: 'MacIntel', plugins: 5 }
+      },
+      meta: {
+        challengeNonce: challenge.nonce,
       }
-      nonce++;
-    }
+    };
 
-    if (!hash.startsWith(target)) {
+    const signalsJson = JSON.stringify(signals);
+    const signalsHash = createHash('sha256').update(signalsJson).digest('hex');
+
+    log(`    Solving PoW with signalsHash (difficulty: ${challenge.difficulty})...`, colors.dim);
+    const solution = solvePoW(challenge.prefix, challenge.difficulty, signalsHash);
+
+    if (!solution) {
       failed++;
       log(`  ✗ Failed to solve PoW within iteration limit`, colors.red);
       return;
     }
 
     passed++;
-    log(`  ✓ PoW solved in ${nonce} iterations`, colors.green);
+    log(`  ✓ PoW solved in ${solution.nonce} iterations`, colors.green);
 
-    // Submit with valid PoW solution
+    // Submit with valid PoW solution + signal commitment
     const validPoWResult = await makeRequest('/api/verify', {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0',
@@ -1526,26 +1549,15 @@ async function testProofOfWork() {
       },
       body: {
         siteKey: 'test',
-        signals: {
-          behavioral: {
-            totalPoints: 80, trajectoryLength: 350,
-            interactionDuration: 1500, velocityVariance: 0.8,
-            microTremorScore: 0.6, directionChanges: 15,
-            mouseEventRate: 60, approachPoints: 12,
-          },
-          environmental: {
-            automationFlags: {
-              chrome: true,
-              platform: 'MacIntel',
-              plugins: 5,
-            }
-          }
-        },
+        signals,
+        signalsJson,
         powSolution: {
           challengeId: challenge.challengeId,
-          nonce: nonce,
-          hash: hash
-        }
+          nonce: solution.nonce,
+          hash: solution.hash,
+          signalsHash
+        },
+        powTiming: { duration: 500, iterations: solution.nonce, difficulty: challenge.difficulty }
       }
     });
 
@@ -1561,18 +1573,41 @@ async function testProofOfWork() {
       log(`  ✗ Valid PoW solution was not accepted`, colors.red);
     }
 
+    // Should not have signal tampering detection
+    const hasTamperDetection = (validPoWResult.detections || []).some(
+      d => d.reason && d.reason.includes('tampered')
+    );
+    if (!hasTamperDetection) {
+      passed++;
+      log(`  ✓ Signal commitment verified successfully`, colors.green);
+    } else {
+      failed++;
+      log(`  ✗ Valid signal commitment was flagged as tampered`, colors.red);
+    }
+
+    // Should not have nonce mismatch detection
+    const hasNonceMismatch = (validPoWResult.detections || []).some(
+      d => d.reason && d.reason.includes('nonce mismatch')
+    );
+    if (!hasNonceMismatch) {
+      passed++;
+      log(`  ✓ Challenge nonce verified successfully`, colors.green);
+    } else {
+      failed++;
+      log(`  ✗ Valid challenge nonce was flagged as mismatch`, colors.red);
+    }
+
     // Test: PoW solution replay attack (same solution used twice)
     const replayResult = await makeRequest('/api/verify', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
-      },
+      headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0' },
       body: {
         siteKey: 'test',
         signals: {},
         powSolution: {
           challengeId: challenge.challengeId,
-          nonce: nonce,
-          hash: hash
+          nonce: solution.nonce,
+          hash: solution.hash,
+          signalsHash
         }
       }
     });
@@ -1595,13 +1630,8 @@ async function testProofOfWork() {
 
   // Test: No PoW solution provided
   const noPoWResult = await makeRequest('/api/verify', {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
-    },
-    body: {
-      siteKey: 'test',
-      signals: {}
-    }
+    headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0' },
+    body: { siteKey: 'test', signals: {} }
   });
 
   const hasMissingPoWDetection = (noPoWResult.detections || []).some(
@@ -1617,17 +1647,11 @@ async function testProofOfWork() {
 
   // Test: Invalid PoW hash
   const invalidHashResult = await makeRequest('/api/verify', {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
-    },
+    headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0' },
     body: {
       siteKey: 'test',
       signals: {},
-      powSolution: {
-        challengeId: 'fake-challenge-id',
-        nonce: 12345,
-        hash: 'invalidhash123'
-      }
+      powSolution: { challengeId: 'fake-challenge-id', nonce: 12345, hash: 'invalidhash123' }
     }
   });
 
@@ -1640,6 +1664,161 @@ async function testProofOfWork() {
   } else {
     failed++;
     log(`  ✗ Invalid PoW solution was not rejected`, colors.red);
+  }
+}
+
+async function testSignalCommitment() {
+  log('\n[Signal Commitment]', colors.cyan);
+
+  const { createHash } = await import('crypto');
+
+  try {
+    // Get a fresh challenge
+    const challengeResponse = await fetch(`${SERVER_URL}/api/pow/challenge?siteKey=test`);
+    const challenge = await challengeResponse.json();
+
+    // Build legitimate signals
+    const signals = {
+      behavioral: {
+        totalPoints: 80, trajectoryLength: 350,
+        interactionDuration: 1500, velocityVariance: 0.8,
+        microTremorScore: 0.6, directionChanges: 15,
+        mouseEventRate: 60, approachPoints: 12,
+      },
+      environmental: {
+        automationFlags: { chrome: true, platform: 'MacIntel', plugins: 5 }
+      },
+      meta: { challengeNonce: challenge.nonce }
+    };
+
+    const signalsJson = JSON.stringify(signals);
+    const signalsHash = createHash('sha256').update(signalsJson).digest('hex');
+
+    // Solve PoW with correct signalsHash
+    const target = '0'.repeat(challenge.difficulty);
+    const inputPrefix = `${challenge.prefix}:${signalsHash}`;
+    let nonce = 0;
+    let hash = '';
+    while (nonce < 10000000) {
+      const input = `${inputPrefix}:${nonce}`;
+      hash = createHash('sha256').update(input).digest('hex');
+      if (hash.startsWith(target)) break;
+      nonce++;
+    }
+
+    // Now submit with TAMPERED signals (different from signalsJson)
+    const tamperedSignals = { ...signals, behavioral: { ...signals.behavioral, totalPoints: 0 } };
+
+    const tamperResult = await makeRequest('/api/verify', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      body: {
+        siteKey: 'test',
+        signals: tamperedSignals,
+        signalsJson: JSON.stringify(tamperedSignals), // Tampered signalsJson won't match signalsHash
+        powSolution: {
+          challengeId: challenge.challengeId,
+          nonce: nonce,
+          hash: hash,
+          signalsHash: signalsHash // Original hash from pre-tamper signals
+        },
+        powTiming: { duration: 500, iterations: nonce, difficulty: challenge.difficulty }
+      }
+    });
+
+    const hasTamperDetection = (tamperResult.detections || []).some(
+      d => d.reason && d.reason.includes('tampered')
+    );
+    if (hasTamperDetection) {
+      passed++;
+      log(`  ✓ Tampered signals detected (signalsHash mismatch)`, colors.green);
+    } else {
+      failed++;
+      log(`  ✗ Tampered signals not detected`, colors.red);
+      log(`    Detections: ${(tamperResult.detections || []).map(d => d.reason).join('; ')}`, colors.dim);
+    }
+
+  } catch (error) {
+    failed++;
+    log(`  ✗ Signal commitment test error: ${error.message}`, colors.red);
+  }
+}
+
+async function testChallengeNonce() {
+  log('\n[Challenge Nonce]', colors.cyan);
+
+  const { createHash } = await import('crypto');
+
+  try {
+    // Get a fresh challenge
+    const challengeResponse = await fetch(`${SERVER_URL}/api/pow/challenge?siteKey=test`);
+    const challenge = await challengeResponse.json();
+
+    // Build signals with WRONG challengeNonce
+    const signals = {
+      behavioral: {
+        totalPoints: 80, trajectoryLength: 350,
+        interactionDuration: 1500, velocityVariance: 0.8,
+        microTremorScore: 0.6, directionChanges: 15,
+        mouseEventRate: 60, approachPoints: 12,
+      },
+      environmental: {
+        automationFlags: { chrome: true, platform: 'MacIntel', plugins: 5 }
+      },
+      meta: { challengeNonce: 'wrong-nonce-value' }
+    };
+
+    const signalsJson = JSON.stringify(signals);
+    const signalsHash = createHash('sha256').update(signalsJson).digest('hex');
+
+    // Solve PoW
+    const target = '0'.repeat(challenge.difficulty);
+    const inputPrefix = `${challenge.prefix}:${signalsHash}`;
+    let nonce = 0;
+    let hash = '';
+    while (nonce < 10000000) {
+      const input = `${inputPrefix}:${nonce}`;
+      hash = createHash('sha256').update(input).digest('hex');
+      if (hash.startsWith(target)) break;
+      nonce++;
+    }
+
+    const nonceResult = await makeRequest('/api/verify', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      body: {
+        siteKey: 'test',
+        signals,
+        signalsJson,
+        powSolution: {
+          challengeId: challenge.challengeId,
+          nonce: nonce,
+          hash: hash,
+          signalsHash
+        },
+        powTiming: { duration: 500, iterations: nonce, difficulty: challenge.difficulty }
+      }
+    });
+
+    const hasNonceMismatch = (nonceResult.detections || []).some(
+      d => d.reason && d.reason.includes('nonce mismatch')
+    );
+    if (hasNonceMismatch) {
+      passed++;
+      log(`  ✓ Wrong challenge nonce detected`, colors.green);
+    } else {
+      failed++;
+      log(`  ✗ Wrong challenge nonce not detected`, colors.red);
+      log(`    Detections: ${(nonceResult.detections || []).map(d => d.reason).join('; ')}`, colors.dim);
+    }
+
+  } catch (error) {
+    failed++;
+    log(`  ✗ Challenge nonce test error: ${error.message}`, colors.red);
   }
 }
 
@@ -1675,6 +1854,8 @@ async function runTests() {
   await testMissingPoWHardFail();
   await testTightenedExemptions();
   await testProofOfWork();
+  await testSignalCommitment();
+  await testChallengeNonce();
   await testKeystrokeCadence();
   await testTokenVerification();
   await testInvisibleMode();

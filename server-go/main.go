@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -105,11 +107,20 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// PowTiming from client (separate from committed signals)
+type PowTiming struct {
+	Duration   float64 `json:"duration"`
+	Iterations int     `json:"iterations"`
+	Difficulty int     `json:"difficulty"`
+}
+
 // VerifyRequest is the request body for verification
 type VerifyRequest struct {
 	SiteKey     string                 `json:"siteKey"`
 	Signals     map[string]interface{} `json:"signals"`
+	SignalsJson string                 `json:"signalsJson,omitempty"`
 	PowSolution *PoWSolution           `json:"powSolution,omitempty"`
+	PowTiming   *PowTiming             `json:"powTiming,omitempty"`
 }
 
 // VerifyResponse is the response for verification
@@ -160,7 +171,51 @@ func verifyHandler(engine *ScoringEngine) http.HandlerFunc {
 		// JA3 hash (if provided by reverse proxy like nginx or Cloudflare)
 		ja3Hash := r.Header.Get("X-JA3-Hash")
 
-		result := engine.VerifyWithHeaders(req.Signals, ip, req.SiteKey, userAgent, headers, ja3Hash, req.PowSolution)
+		// Verify signal commitment
+		signals := req.Signals
+		clientSignalsHash := ""
+		if req.PowSolution != nil {
+			clientSignalsHash = req.PowSolution.SignalsHash
+		}
+		extraDetections := make([]DetectionResult, 0)
+		if req.SignalsJson != "" && clientSignalsHash != "" {
+			computedHash := sha256.Sum256([]byte(req.SignalsJson))
+			computedHashHex := hex.EncodeToString(computedHash[:])
+			if computedHashHex != clientSignalsHash {
+				extraDetections = append(extraDetections, DetectionResult{
+					Category:   CategoryBot,
+					Score:      0.95,
+					Confidence: 0.95,
+					Reason:     "Signals tampered after PoW (signalsHash mismatch)",
+				})
+			}
+			// Use signalsJson as the canonical signals source
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(req.SignalsJson), &parsed); err == nil {
+				signals = parsed
+			}
+		}
+
+		// Inject powTiming into signals.temporal.pow
+		if req.PowTiming != nil {
+			temporal, ok := signals["temporal"].(map[string]interface{})
+			if !ok {
+				temporal = make(map[string]interface{})
+				signals["temporal"] = temporal
+			}
+			temporal["pow"] = map[string]interface{}{
+				"duration":   req.PowTiming.Duration,
+				"iterations": float64(req.PowTiming.Iterations),
+				"difficulty": float64(req.PowTiming.Difficulty),
+			}
+		}
+
+		result := engine.VerifyWithHeaders(signals, ip, req.SiteKey, userAgent, headers, ja3Hash, req.PowSolution)
+
+		// Add signal commitment detections to results
+		if len(extraDetections) > 0 {
+			result.Detections = append(extraDetections, result.Detections...)
+		}
 
 		// Convert detections
 		detections := make([]DetectionInfo, 0, len(result.Detections))
@@ -192,8 +247,10 @@ func verifyHandler(engine *ScoringEngine) http.HandlerFunc {
 type InvisibleScoreRequest struct {
 	SiteKey     string                 `json:"siteKey"`
 	Signals     map[string]interface{} `json:"signals"`
+	SignalsJson string                 `json:"signalsJson,omitempty"`
 	Action      string                 `json:"action"`
 	PowSolution *PoWSolution           `json:"powSolution,omitempty"`
+	PowTiming   *PowTiming             `json:"powTiming,omitempty"`
 }
 
 func invisibleScoreHandler(engine *ScoringEngine) http.HandlerFunc {
@@ -219,7 +276,49 @@ func invisibleScoreHandler(engine *ScoringEngine) http.HandlerFunc {
 			}
 		}
 		ja3 := r.Header.Get("X-JA3-Hash")
-		result := engine.VerifyWithHeaders(req.Signals, ip, req.SiteKey, userAgent, scoreHeaders, ja3, req.PowSolution)
+
+		// Verify signal commitment
+		signals := req.Signals
+		clientSigHash := ""
+		if req.PowSolution != nil {
+			clientSigHash = req.PowSolution.SignalsHash
+		}
+		scoreExtraDetections := make([]DetectionResult, 0)
+		if req.SignalsJson != "" && clientSigHash != "" {
+			cHash := sha256.Sum256([]byte(req.SignalsJson))
+			cHashHex := hex.EncodeToString(cHash[:])
+			if cHashHex != clientSigHash {
+				scoreExtraDetections = append(scoreExtraDetections, DetectionResult{
+					Category:   CategoryBot,
+					Score:      0.95,
+					Confidence: 0.95,
+					Reason:     "Signals tampered after PoW (signalsHash mismatch)",
+				})
+			}
+			var parsed map[string]interface{}
+			if err := json.Unmarshal([]byte(req.SignalsJson), &parsed); err == nil {
+				signals = parsed
+			}
+		}
+
+		// Inject powTiming
+		if req.PowTiming != nil {
+			temporal, ok := signals["temporal"].(map[string]interface{})
+			if !ok {
+				temporal = make(map[string]interface{})
+				signals["temporal"] = temporal
+			}
+			temporal["pow"] = map[string]interface{}{
+				"duration":   req.PowTiming.Duration,
+				"iterations": float64(req.PowTiming.Iterations),
+				"difficulty": float64(req.PowTiming.Difficulty),
+			}
+		}
+
+		result := engine.VerifyWithHeaders(signals, ip, req.SiteKey, userAgent, scoreHeaders, ja3, req.PowSolution)
+		if len(scoreExtraDetections) > 0 {
+			result.Detections = append(scoreExtraDetections, result.Detections...)
+		}
 
 		resp := map[string]interface{}{
 			"success":        result.Success,
@@ -270,6 +369,7 @@ type PoWChallengeResponse struct {
 	Prefix      string `json:"prefix"`
 	Difficulty  int    `json:"difficulty"`
 	ExpiresAt   int64  `json:"expiresAt"`
+	Nonce       string `json:"nonce"`
 	Sig         string `json:"sig"`
 }
 
@@ -296,6 +396,7 @@ func powChallengeHandler(engine *ScoringEngine) http.HandlerFunc {
 			Prefix:      challenge.Prefix,
 			Difficulty:  challenge.Difficulty,
 			ExpiresAt:   challenge.ExpiresAt,
+			Nonce:       challenge.Nonce,
 			Sig:         challenge.Sig,
 		}
 
