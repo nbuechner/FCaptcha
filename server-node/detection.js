@@ -312,6 +312,53 @@ function checkJA3Fingerprint(ja3Hash) {
 }
 
 // =============================================================================
+// TLS Fingerprinting (JA4) — read from trusted reverse-proxy headers
+// =============================================================================
+//
+// Unlike the client-supplied X-JA3-Hash (which attackers can spoof), JA4
+// fingerprints are computed from the TLS ClientHello by the reverse proxy
+// and passed via a trusted header the server is configured to accept.
+// Configure with: TRUSTED_JA4_HEADERS=cf-ja4,x-tls-ja4 (comma-separated).
+
+const KNOWN_BOT_JA4_HASHES = {
+  // Populate with observed automation fingerprints in production.
+  // JA4 format: t##d####_####..._####
+  // Placeholders — administrators should add real fingerprints as they
+  // are collected from deployed environments.
+  // Example once identified:
+  //   't13d1516h2_8daaf6152771_02713d6af862': 'Go default stdlib TLS'
+};
+
+function getTrustedJA4HeaderNames() {
+  const env = process.env.TRUSTED_JA4_HEADERS;
+  if (!env) return [];
+  return env.split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
+}
+
+function readJA4FromHeaders(headers, trustedHeaderNames) {
+  if (!trustedHeaderNames || trustedHeaderNames.length === 0) return null;
+  for (const name of trustedHeaderNames) {
+    const v = headers[name];
+    if (v && typeof v === 'string' && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+function checkJA4Fingerprint(ja4) {
+  if (!ja4) return [];
+  const match = KNOWN_BOT_JA4_HASHES[ja4];
+  if (match) {
+    return [{
+      category: 'fingerprint',
+      score: 0.8,
+      confidence: 0.9,
+      reason: `TLS JA4 fingerprint matches: ${match}`
+    }];
+  }
+  return [];
+}
+
+// =============================================================================
 // Statistical Utility Functions (Keystroke Cadence Analysis)
 // =============================================================================
 
@@ -998,6 +1045,10 @@ module.exports = {
   parseUserAgent,
   checkBrowserConsistency,
   checkJA3Fingerprint,
+  checkJA4Fingerprint,
+  getTrustedJA4HeaderNames,
+  readJA4FromHeaders,
+  KNOWN_BOT_JA4_HASHES,
   analyzeFormInteraction,
   // Advanced fingerprint detection functions
   analyzeWebRTC,

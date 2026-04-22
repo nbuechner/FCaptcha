@@ -4,6 +4,7 @@ FCaptcha Detection Module - Additional Detection Capabilities
 IP Reputation, Header Analysis, Browser Consistency, TLS Fingerprinting
 """
 
+import os
 import re
 import math
 import socket
@@ -307,6 +308,55 @@ def check_ja3_fingerprint(ja3_hash: Optional[str]) -> List[Dict]:
             "reason": f"TLS fingerprint matches: {KNOWN_BOT_JA3_HASHES[ja3_hash]}"
         }]
 
+    return []
+
+
+# =============================================================================
+# TLS Fingerprinting (JA4) — read from trusted reverse-proxy headers
+# =============================================================================
+#
+# Unlike client-supplied X-JA3-Hash (spoofable), JA4 fingerprints are computed
+# from the TLS ClientHello by the reverse proxy and passed via a trusted header
+# the server is configured to accept via TRUSTED_JA4_HEADERS env var.
+
+KNOWN_BOT_JA4_HASHES: Dict[str, str] = {
+    # Populate with observed automation fingerprints in production.
+    # JA4 format: t##d####_####..._####
+    # Placeholders — administrators should add real fingerprints as collected.
+    # Example once identified:
+    #   "t13d1516h2_8daaf6152771_02713d6af862": "Go default stdlib TLS",
+}
+
+
+def get_trusted_ja4_header_names() -> List[str]:
+    env = os.environ.get("TRUSTED_JA4_HEADERS", "")
+    if not env:
+        return []
+    return [h.strip().lower() for h in env.split(",") if h.strip()]
+
+
+def read_ja4_from_headers(headers: Dict[str, str], trusted_names: List[str]) -> Optional[str]:
+    if not trusted_names:
+        return None
+    lower = {k.lower(): v for k, v in headers.items()}
+    for name in trusted_names:
+        v = lower.get(name)
+        if v and isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def check_ja4_fingerprint(ja4: Optional[str]) -> List[Dict]:
+    if not ja4:
+        return []
+    match = KNOWN_BOT_JA4_HASHES.get(ja4)
+    if match:
+        return [{
+            "category": "fingerprint",
+            "score": 0.8,
+            "confidence": 0.9,
+            "reason": f"TLS JA4 fingerprint matches: {match}"
+        }]
     return []
 
 

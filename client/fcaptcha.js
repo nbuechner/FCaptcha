@@ -28,6 +28,9 @@
       this.scrollEvents = [];
       this.keyEvents = [];
       this.touchEvents = [];
+      this.touchMultiTouchSeen = false;
+      this.touchIdentifiers = new Set();
+      this.pointerPoints = [];
       this.focusEvents = [];
       this.clickData = null;
       this.startTime = Date.now();
@@ -108,14 +111,40 @@
     }
 
     recordTouch(e) {
-      const touch = e.touches[0] || e.changedTouches[0];
-      if (touch) {
-        this.touchEvents.push({
-          x: touch.clientX,
-          y: touch.clientY,
-          t: performance.now()
-        });
-      }
+      const touches = (e.touches && e.touches.length) ? e.touches : e.changedTouches;
+      if (!touches || touches.length === 0) return;
+      if (touches.length > 1) this.touchMultiTouchSeen = true;
+
+      const touch = touches[0];
+      if (typeof touch.identifier === 'number') this.touchIdentifiers.add(touch.identifier);
+
+      this.touchEvents.push({
+        x: touch.clientX,
+        y: touch.clientY,
+        t: performance.now(),
+        force: typeof touch.force === 'number' ? touch.force : 0,
+        radiusX: typeof touch.radiusX === 'number' ? touch.radiusX : 0,
+        radiusY: typeof touch.radiusY === 'number' ? touch.radiusY : 0,
+        rotationAngle: typeof touch.rotationAngle === 'number' ? touch.rotationAngle : 0,
+        identifier: typeof touch.identifier === 'number' ? touch.identifier : -1,
+        touchCount: touches.length
+      });
+      if (this.touchEvents.length > 500) this.touchEvents.shift();
+    }
+
+    recordPointer(e) {
+      this.pointerPoints.push({
+        x: e.clientX,
+        y: e.clientY,
+        t: performance.now(),
+        type: e.type,
+        pressure: typeof e.pressure === 'number' ? e.pressure : 0,
+        tiltX: typeof e.tiltX === 'number' ? e.tiltX : 0,
+        tiltY: typeof e.tiltY === 'number' ? e.tiltY : 0,
+        tangentialPressure: typeof e.tangentialPressure === 'number' ? e.tangentialPressure : 0,
+        pointerType: e.pointerType || 'unknown'
+      });
+      if (this.pointerPoints.length > 500) this.pointerPoints.shift();
     }
 
     recordFocus(e) {
@@ -190,6 +219,12 @@
         trajectoryLength += Math.sqrt(dx*dx + dy*dy);
       }
 
+      // Touch kinematics (mobile-native behavioral signal)
+      const touchAnalysis = this._analyzeTouchPoints(this.touchEvents);
+
+      // Pointer event aggregates (stylus/pen high-entropy signal)
+      const pointerAnalysis = this._analyzePointerPoints(this.pointerPoints);
+
       return {
         totalPoints: positions.length,
         trajectoryLength,
@@ -209,7 +244,100 @@
         touchEvents: this.touchEvents.length,
         focusEvents: this.focusEvents.length,
         clickData: this.clickData,
-        interactionDuration: Date.now() - this.startTime
+        interactionDuration: Date.now() - this.startTime,
+        ...touchAnalysis,
+        ...pointerAnalysis
+      };
+    }
+
+    _analyzeTouchPoints(touches) {
+      if (!touches || touches.length === 0) {
+        return {
+          touchTotalPoints: 0,
+          touchTrajectoryLength: 0,
+          touchAvgVelocity: 0,
+          touchVelocityVariance: 0,
+          touchMicroTremorScore: 0,
+          touchStraightLineRatio: 0,
+          touchDirectionChanges: 0,
+          touchForceMin: 0,
+          touchForceMax: 0,
+          touchForceVariance: 0,
+          touchRadiusMin: 0,
+          touchRadiusMax: 0,
+          touchRadiusVariance: 0,
+          touchMultiTouchSeen: this.touchMultiTouchSeen,
+          touchUniqueIdentifiers: this.touchIdentifiers.size,
+          touchForceAllZero: false,
+          touchForceAllOne: false
+        };
+      }
+
+      let trajLen = 0;
+      const vels = [];
+      for (let i = 1; i < touches.length; i++) {
+        const dx = touches[i].x - touches[i-1].x;
+        const dy = touches[i].y - touches[i-1].y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        trajLen += dist;
+        const dt = touches[i].t - touches[i-1].t;
+        if (dt > 0) vels.push(dist / dt);
+      }
+      const avgVel = vels.length > 0 ? vels.reduce((a, b) => a + b, 0) / vels.length : 0;
+
+      const forces = touches.map(p => p.force);
+      const radii = touches.map(p => Math.max(p.radiusX || 0, p.radiusY || 0));
+      const forceAllZero = forces.length > 0 && forces.every(f => f === 0);
+      const forceAllOne = forces.length > 0 && forces.every(f => f === 1);
+
+      return {
+        touchTotalPoints: touches.length,
+        touchTrajectoryLength: trajLen,
+        touchAvgVelocity: avgVel,
+        touchVelocityVariance: this._variance(vels),
+        touchMicroTremorScore: this._detectMicroTremor(touches),
+        touchStraightLineRatio: this._calculateStraightLineRatio(touches),
+        touchDirectionChanges: this._countDirectionChanges(touches),
+        touchForceMin: forces.length > 0 ? Math.min(...forces) : 0,
+        touchForceMax: forces.length > 0 ? Math.max(...forces) : 0,
+        touchForceVariance: this._variance(forces),
+        touchRadiusMin: radii.length > 0 ? Math.min(...radii) : 0,
+        touchRadiusMax: radii.length > 0 ? Math.max(...radii) : 0,
+        touchRadiusVariance: this._variance(radii),
+        touchMultiTouchSeen: this.touchMultiTouchSeen,
+        touchUniqueIdentifiers: this.touchIdentifiers.size,
+        touchForceAllZero: forceAllZero,
+        touchForceAllOne: forceAllOne
+      };
+    }
+
+    _analyzePointerPoints(points) {
+      if (!points || points.length === 0) {
+        return {
+          pointerEvents: 0,
+          pointerAvgPressure: 0,
+          pointerPressureVariance: 0,
+          pointerMaxTilt: 0,
+          pointerHasNonMouseType: false,
+          pointerTypes: []
+        };
+      }
+      const pressures = points.map(p => p.pressure);
+      const avgP = pressures.length > 0 ? pressures.reduce((a, b) => a + b, 0) / pressures.length : 0;
+      let maxTilt = 0;
+      const types = new Set();
+      for (const p of points) {
+        const tilt = Math.abs(p.tiltX || 0) + Math.abs(p.tiltY || 0);
+        if (tilt > maxTilt) maxTilt = tilt;
+        if (p.pointerType) types.add(p.pointerType);
+      }
+      return {
+        pointerEvents: points.length,
+        pointerAvgPressure: avgP,
+        pointerPressureVariance: this._variance(pressures),
+        pointerMaxTilt: maxTilt,
+        pointerHasNonMouseType: Array.from(types).some(t => t !== 'mouse' && t !== 'unknown'),
+        pointerTypes: Array.from(types)
       };
     }
 
@@ -392,7 +520,9 @@
         eventDeltas: [], eventDeltaVariance: 0, mouseEventRate: 0,
         scrollEvents: this.scrollEvents.length, keyEvents: this.keyEvents.length,
         touchEvents: this.touchEvents.length, focusEvents: this.focusEvents.length,
-        clickData: this.clickData, interactionDuration: Date.now() - this.startTime
+        clickData: this.clickData, interactionDuration: Date.now() - this.startTime,
+        ...this._analyzeTouchPoints(this.touchEvents),
+        ...this._analyzePointerPoints(this.pointerPoints)
       };
     }
 
@@ -400,6 +530,94 @@
       return {
         clickPrecision: 0, explorationRatio: 0, overshootCorrections: 0,
         hoverTime: 0, approachDirectness: 1, approachPoints: 0
+      };
+    }
+  }
+
+  // ============================================================
+  // Sensor Collector (passive DeviceMotion/Orientation)
+  // ============================================================
+  //
+  // Listens opportunistically for devicemotion/deviceorientation events.
+  // Does NOT call requestPermission(): on iOS 13+ events simply won't fire
+  // without permission, which we treat as neutral server-side. On Android
+  // and older iOS the events fire freely, and flat accelerometer readings
+  // distinguish emulators from real phones.
+
+  class SensorCollector {
+    constructor() {
+      this.motionEvents = [];
+      this.orientationEvents = [];
+      this._motionHandler = (e) => this._recordMotion(e);
+      this._orientationHandler = (e) => this._recordOrientation(e);
+      this._attached = false;
+    }
+
+    attach() {
+      if (this._attached) return;
+      this._attached = true;
+      try {
+        window.addEventListener('devicemotion', this._motionHandler, { passive: true });
+        window.addEventListener('deviceorientation', this._orientationHandler, { passive: true });
+      } catch (_e) { /* ignore */ }
+    }
+
+    detach() {
+      if (!this._attached) return;
+      this._attached = false;
+      try {
+        window.removeEventListener('devicemotion', this._motionHandler);
+        window.removeEventListener('deviceorientation', this._orientationHandler);
+      } catch (_e) { /* ignore */ }
+    }
+
+    _recordMotion(e) {
+      const a = e.accelerationIncludingGravity || e.acceleration || {};
+      this.motionEvents.push({
+        x: typeof a.x === 'number' ? a.x : 0,
+        y: typeof a.y === 'number' ? a.y : 0,
+        z: typeof a.z === 'number' ? a.z : 0,
+        t: performance.now()
+      });
+      if (this.motionEvents.length > 300) this.motionEvents.shift();
+    }
+
+    _recordOrientation(e) {
+      this.orientationEvents.push({
+        alpha: typeof e.alpha === 'number' ? e.alpha : 0,
+        beta: typeof e.beta === 'number' ? e.beta : 0,
+        gamma: typeof e.gamma === 'number' ? e.gamma : 0,
+        t: performance.now()
+      });
+      if (this.orientationEvents.length > 300) this.orientationEvents.shift();
+    }
+
+    analyze() {
+      const motion = this.motionEvents;
+      const orientation = this.orientationEvents;
+
+      let motionAccelVariance = 0;
+      let motionAccelAvg = 0;
+      if (motion.length > 1) {
+        const mags = motion.map(m => Math.sqrt(m.x*m.x + m.y*m.y + m.z*m.z));
+        motionAccelAvg = mags.reduce((a, b) => a + b, 0) / mags.length;
+        motionAccelVariance = mags.reduce((s, v) => s + (v - motionAccelAvg) * (v - motionAccelAvg), 0) / mags.length;
+      }
+
+      let orientationVariance = 0;
+      if (orientation.length > 1) {
+        const tilts = orientation.map(o => Math.abs(o.beta) + Math.abs(o.gamma));
+        const mean = tilts.reduce((a, b) => a + b, 0) / tilts.length;
+        orientationVariance = tilts.reduce((s, v) => s + (v - mean) * (v - mean), 0) / tilts.length;
+      }
+
+      return {
+        motionEventCount: motion.length,
+        motionAccelAvg,
+        motionAccelVariance,
+        orientationEventCount: orientation.length,
+        orientationVariance,
+        hasSensorSupport: typeof window.DeviceMotionEvent !== 'undefined'
       };
     }
   }
@@ -1866,6 +2084,7 @@
       this.behavioral = new BehavioralCollector();
       this.environmental = new EnvironmentalCollector();
       this.temporal = new TemporalCollector();
+      this.sensor = new SensorCollector();
       this.powManager = getPoWManager();
       this.token = null;
       this.verified = false;
@@ -1972,8 +2191,14 @@
       document.addEventListener('keyup', (e) => this.behavioral.recordKeyEvent(e), { passive: true });
       document.addEventListener('touchstart', (e) => this.behavioral.recordTouch(e), { passive: true });
       document.addEventListener('touchmove', (e) => this.behavioral.recordTouch(e), { passive: true });
+      document.addEventListener('pointermove', (e) => this.behavioral.recordPointer(e), { passive: true });
+      document.addEventListener('pointerdown', (e) => this.behavioral.recordPointer(e), { passive: true });
+      document.addEventListener('pointerup', (e) => this.behavioral.recordPointer(e), { passive: true });
       document.addEventListener('focus', (e) => this.behavioral.recordFocus(e), { passive: true, capture: true });
       document.addEventListener('blur', (e) => this.behavioral.recordFocus(e), { passive: true, capture: true });
+
+      // Passive device sensors (no permission request; absence treated as neutral server-side)
+      this.sensor.attach();
 
       // First interaction
       const recordFirst = () => this.temporal.recordFirstInteraction();
@@ -2018,9 +2243,10 @@
         const formAnalysis = getFormAnalyzer().analyze();
 
         // Step 2: Build signals object (without pow timing)
+        const sensorData = this.sensor.analyze();
         const signals = {
           behavioral: { ...behavioralData, ...clickData },
-          environmental: { ...envData, rafConsistency: rafData, ...asyncEnvData },
+          environmental: { ...envData, rafConsistency: rafData, ...asyncEnvData, sensor: sensorData },
           temporal: temporalData,
           formAnalysis: formAnalysis,
           meta: {
@@ -2100,7 +2326,7 @@
 
       // Zero mouse movement detection (AI agent / programmatic click)
       // Exempt touch users (mobile) and keyboard-only users (accessibility)
-      const isTouchUser = (b.touchEvents || 0) > 0;
+      const isTouchUser = (b.touchEvents || 0) >= 3;
       const isKbdUser = (b.keyEvents || 0) > 0 && b.totalPoints === 0;
       if (b.totalPoints < 5 && b.trajectoryLength < 10 && !isTouchUser && !isKbdUser) score += 0.35;
       else if (b.totalPoints < 10 && !isTouchUser && !isKbdUser && b.trajectoryLength < 30) score += 0.15;
@@ -2170,6 +2396,9 @@
       this.token = null;
       this.behavioral = new BehavioralCollector();
       this.temporal = new TemporalCollector();
+      if (this.sensor) this.sensor.detach();
+      this.sensor = new SensorCollector();
+      this.sensor.attach();
       this.powManager.reset();
       this.checkbox.classList.remove('verified', 'failed', 'loading');
       this.checkbox.setAttribute('aria-checked', 'false');
@@ -2199,6 +2428,7 @@
       this.behavioral = new BehavioralCollector();
       this.environmental = new EnvironmentalCollector();
       this.temporal = new TemporalCollector();
+      this.sensor = new SensorCollector();
       this.powManager = new PoWManager();
       this.startTime = Date.now();
       this.lastScore = null;
@@ -2240,6 +2470,9 @@
         keyup: (e) => this.behavioral.recordKeyEvent(e),
         touchmove: (e) => this.behavioral.recordTouch(e),
         touchstart: (e) => this.behavioral.recordTouch(e),
+        pointermove: (e) => this.behavioral.recordPointer(e),
+        pointerdown: (e) => this.behavioral.recordPointer(e),
+        pointerup: (e) => this.behavioral.recordPointer(e),
         focus: (e) => this.behavioral.recordFocus(e),
         blur: (e) => this.behavioral.recordFocus(e)
       };
@@ -2250,6 +2483,9 @@
         document.addEventListener(event, handler, opts);
         this.listeners.push({ event, handler, opts });
       }
+
+      // Passive device sensors (no permission request)
+      this.sensor.attach();
     }
 
     _attachToForms() {
@@ -2310,9 +2546,10 @@
       const formAnalysis = getFormAnalyzer().analyze();
 
       // Step 2: Build signals object (without pow timing)
+      const sensorData = this.sensor.analyze();
       const signals = {
         behavioral: behavioralData,
-        environmental: { ...envData, rafConsistency: rafData, ...asyncEnvData },
+        environmental: { ...envData, rafConsistency: rafData, ...asyncEnvData, sensor: sensorData },
         temporal: temporalData,
         formAnalysis: formAnalysis,
         meta: {
@@ -2389,7 +2626,7 @@
 
       // Zero mouse movement detection (AI agent / programmatic click)
       // Exempt touch users (mobile) and keyboard-only users (accessibility)
-      const isTouchUsr = (b.touchEvents || 0) > 0;
+      const isTouchUsr = (b.touchEvents || 0) >= 3;
       const isKbdUsr = (b.keyEvents || 0) > 0 && b.totalPoints === 0;
       if (b.totalPoints < 5 && b.trajectoryLength < 10 && !isTouchUsr && !isKbdUsr) score += 0.35;
       else if (b.totalPoints < 10 && !isTouchUsr && !isKbdUsr && b.trajectoryLength < 30) score += 0.15;

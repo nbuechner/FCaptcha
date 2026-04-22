@@ -1472,6 +1472,214 @@ async function testTightenedExemptions() {
   assertDetection(legitimateKbdResult, 'vision_ai', false, 'keyEvents=2 with no mouse still exempts');
 }
 
+async function testMobileSensorDetection() {
+  log('\n[Mobile Sensor & Touch Authenticity]', colors.cyan);
+
+  const mobileUA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148';
+  const desktopUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0';
+
+  // ---- Mobile UA with flat/synthetic touch force → behavioral detection fires ----
+  const syntheticTouchResult = await makeRequest('/api/verify', {
+    headers: { 'User-Agent': mobileUA, 'Accept-Language': 'en-US,en;q=0.9' },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 0, trajectoryLength: 0, approachPoints: 0, keyEvents: 0,
+          touchEvents: 10,
+          touchTotalPoints: 10,
+          touchForceMin: 1, touchForceMax: 1, touchForceVariance: 0,
+          touchForceAllOne: true,
+          touchRadiusMin: 0, touchRadiusMax: 0, touchRadiusVariance: 0,
+          touchUniqueIdentifiers: 1,
+          interactionDuration: 1500,
+        }
+      }
+    }
+  });
+  assertDetection(syntheticTouchResult, 'behavioral', true,
+    'Mobile UA with force=1 across all touches triggers behavioral detection');
+
+  // ---- Mobile UA with healthy touch entropy → should NOT trigger new detectors ----
+  const realTouchResult = await makeRequest('/api/verify', {
+    headers: { 'User-Agent': mobileUA, 'Accept-Language': 'en-US,en;q=0.9' },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 0, trajectoryLength: 0, approachPoints: 0, keyEvents: 0,
+          touchEvents: 12,
+          touchTotalPoints: 12,
+          touchForceMin: 0.2, touchForceMax: 0.95, touchForceVariance: 0.08,
+          touchForceAllOne: false, touchForceAllZero: false,
+          touchRadiusMin: 14, touchRadiusMax: 28, touchRadiusVariance: 12,
+          touchUniqueIdentifiers: 3,
+          touchMultiTouchSeen: true,
+          touchStraightLineRatio: 0.3,
+          touchMicroTremorScore: 0.4,
+          touchDirectionChanges: 8,
+          interactionDuration: 2100,
+        }
+      }
+    }
+  });
+  // Base touch score may still be non-zero due to other signals, but the three
+  // new behavioral sub-detectors (force-variance, all-ones, radius uniformity,
+  // identifiers) must not fire on this fixture.
+  const realTouchBehavioralReasons = (realTouchResult.detections || [])
+    .filter(d => d.category === 'behavioral')
+    .map(d => d.reason || '');
+  const didSyntheticFire = realTouchBehavioralReasons.some(r =>
+    /synthetic|identical|lack identifier|unnaturally smooth|force=1\.0/i.test(r));
+  if (!didSyntheticFire) {
+    passed++;
+    log('  ✓ Mobile UA with healthy touch entropy does not trigger synthetic-touch detectors', colors.green);
+  } else {
+    failed++;
+    log('  ✗ Mobile UA with healthy touch entropy triggered a synthetic-touch detector', colors.red);
+    log(`    Reasons: ${realTouchBehavioralReasons.join(' | ')}`, colors.dim);
+  }
+
+  // ---- Mobile UA with flat motion sensor → headless detection fires ----
+  const flatSensorResult = await makeRequest('/api/verify', {
+    headers: { 'User-Agent': mobileUA, 'Accept-Language': 'en-US,en;q=0.9' },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 0, trajectoryLength: 0, approachPoints: 0, keyEvents: 0,
+          touchEvents: 5, touchTotalPoints: 5,
+          touchForceMin: 0.3, touchForceMax: 0.8, touchForceVariance: 0.05,
+          touchRadiusMin: 12, touchRadiusMax: 22, touchRadiusVariance: 8,
+          touchUniqueIdentifiers: 2,
+          interactionDuration: 1500,
+        },
+        environmental: {
+          sensor: {
+            motionEventCount: 30,
+            motionAccelVariance: 0.0001,
+            orientationEventCount: 0,
+            orientationVariance: 0,
+          }
+        }
+      }
+    }
+  });
+  const flatSensorReasons = (flatSensorResult.detections || [])
+    .filter(d => d.category === 'headless')
+    .map(d => d.reason || '');
+  const motionFlatFired = flatSensorReasons.some(r => /sensor active but flat/i.test(r));
+  if (motionFlatFired) {
+    passed++;
+    log('  ✓ Flat motion sensor on mobile UA triggers headless detection', colors.green);
+  } else {
+    failed++;
+    log('  ✗ Flat motion sensor on mobile UA did not trigger headless detection', colors.red);
+    log(`    Detections: ${(flatSensorResult.detections || []).map(d => d.category).join(', ')}`, colors.dim);
+  }
+
+  // ---- Mobile UA with NO sensor events → neutral (iOS w/o permission) ----
+  const noSensorResult = await makeRequest('/api/verify', {
+    headers: { 'User-Agent': mobileUA, 'Accept-Language': 'en-US,en;q=0.9' },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 0, trajectoryLength: 0, approachPoints: 0, keyEvents: 0,
+          touchEvents: 5, touchTotalPoints: 5,
+          touchForceMin: 0.3, touchForceMax: 0.8, touchForceVariance: 0.05,
+          touchRadiusMin: 12, touchRadiusMax: 22, touchRadiusVariance: 8,
+          touchUniqueIdentifiers: 2,
+          interactionDuration: 1500,
+        },
+        environmental: {
+          sensor: {
+            motionEventCount: 0, motionAccelVariance: 0,
+            orientationEventCount: 0, orientationVariance: 0,
+          }
+        }
+      }
+    }
+  });
+  const noSensorReasons = (noSensorResult.detections || [])
+    .filter(d => d.category === 'headless')
+    .map(d => d.reason || '');
+  const noSensorFalsePositive = noSensorReasons.some(r => /sensor active but flat/i.test(r));
+  if (!noSensorFalsePositive) {
+    passed++;
+    log('  ✓ Absent sensor events on mobile UA treated as neutral (no penalty)', colors.green);
+  } else {
+    failed++;
+    log('  ✗ Absent sensor events on mobile UA incorrectly triggered sensor detector', colors.red);
+  }
+
+  // ---- Desktop UA with flat sensor → mobile detectors must skip ----
+  const desktopFlatSensorResult = await makeRequest('/api/verify', {
+    headers: { 'User-Agent': desktopUA, 'Accept-Language': 'en-US,en;q=0.9' },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 50, trajectoryLength: 300, approachPoints: 15,
+          touchEvents: 0, keyEvents: 0,
+          velocityVariance: 0.5, microTremorScore: 0.3, straightLineRatio: 0.4,
+          interactionDuration: 2000,
+        },
+        environmental: {
+          sensor: {
+            motionEventCount: 30, motionAccelVariance: 0.0001,
+            orientationEventCount: 20, orientationVariance: 0.0001,
+          }
+        }
+      }
+    }
+  });
+  const desktopHeadlessReasons = (desktopFlatSensorResult.detections || [])
+    .filter(d => d.category === 'headless')
+    .map(d => d.reason || '');
+  const desktopSensorFired = desktopHeadlessReasons.some(r => /sensor active but flat/i.test(r));
+  if (!desktopSensorFired) {
+    passed++;
+    log('  ✓ Desktop UA: sensor detector skipped (UA gate works)', colors.green);
+  } else {
+    failed++;
+    log('  ✗ Desktop UA: sensor detector wrongly fired', colors.red);
+  }
+
+  // ---- Mobile UA with straight-line touch trajectory → kinematics detector fires ----
+  const straightTouchResult = await makeRequest('/api/verify', {
+    headers: { 'User-Agent': mobileUA, 'Accept-Language': 'en-US,en;q=0.9' },
+    body: {
+      siteKey: 'test',
+      signals: {
+        behavioral: {
+          totalPoints: 0, trajectoryLength: 0, approachPoints: 0, keyEvents: 0,
+          touchEvents: 25, touchTotalPoints: 25,
+          touchForceMin: 0.3, touchForceMax: 0.7, touchForceVariance: 0.04,
+          touchRadiusMin: 12, touchRadiusMax: 20, touchRadiusVariance: 6,
+          touchUniqueIdentifiers: 2,
+          touchStraightLineRatio: 0.95,
+          touchMicroTremorScore: 0.3,
+          touchDirectionChanges: 3,
+          interactionDuration: 1500,
+        }
+      }
+    }
+  });
+  const kinematicsReasons = (straightTouchResult.detections || [])
+    .filter(d => d.category === 'behavioral')
+    .map(d => d.reason || '');
+  const kinematicsFired = kinematicsReasons.some(r => /too straight|automation pattern/i.test(r));
+  if (kinematicsFired) {
+    passed++;
+    log('  ✓ Straight-line touch path triggers kinematics detector', colors.green);
+  } else {
+    failed++;
+    log('  ✗ Straight-line touch path did not trigger kinematics detector', colors.red);
+    log(`    Behavioral reasons: ${kinematicsReasons.join(' | ')}`, colors.dim);
+  }
+}
+
 async function testProofOfWork() {
   log('\n[Proof of Work]', colors.cyan);
 
@@ -1853,6 +2061,7 @@ async function runTests() {
   await testPlaywrightDetection();
   await testMissingPoWHardFail();
   await testTightenedExemptions();
+  await testMobileSensorDetection();
   await testProofOfWork();
   await testSignalCommitment();
   await testChallengeNonce();

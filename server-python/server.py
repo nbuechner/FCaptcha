@@ -330,7 +330,7 @@ def detect_vision_ai(signals: Dict) -> List[Detection]:
     approach_pts = b.get("approachPoints", 0)
     touch_events = b.get("touchEvents", 0)
     key_events = b.get("keyEvents", 0)
-    is_touch_user = touch_events >= 1
+    is_touch_user = touch_events >= 3
     is_keyboard_user = key_events >= 2 and total_points == 0
 
     if total_points < 5 and trajectory < 10 and not is_touch_user and not is_keyboard_user:
@@ -576,7 +576,7 @@ def detect_behavioral(signals: Dict) -> List[Detection]:
     trajectory = b.get("trajectoryLength", 0)
     touch_events = b.get("touchEvents", 0)
     key_events = b.get("keyEvents", 0)
-    is_touch_user = touch_events >= 1
+    is_touch_user = touch_events >= 3
     is_keyboard_user = key_events >= 2 and total_points == 0
 
     if total_points == 0 and not is_touch_user and not is_keyboard_user:
@@ -656,6 +656,126 @@ def detect_behavioral(signals: Dict) -> List[Detection]:
         detections.append(Detection(
             ThreatCategory.BEHAVIORAL, 0.4, 0.4,
             "Too few direction changes"
+        ))
+
+    return detections
+
+
+# =============================================================================
+# Mobile-native detectors (touch authenticity, sensor entropy, touch kinematics)
+# UA-gated on mobile. Non-mobile UAs: no-op. Designed never to penalize iOS
+# Safari without DeviceMotion permission (absence treated as neutral).
+# =============================================================================
+
+_MOBILE_UA_PATTERN = re.compile(r"mobile|android|iphone|ipad|ipod", re.IGNORECASE)
+
+
+def _is_mobile_ua(user_agent: str) -> bool:
+    return bool(_MOBILE_UA_PATTERN.search(user_agent or ""))
+
+
+def detect_touch_authenticity(signals: Dict, user_agent: str) -> List[Detection]:
+    detections: List[Detection] = []
+    if not _is_mobile_ua(user_agent):
+        return detections
+
+    b = signals.get("behavioral", {}) or {}
+    touch_points = b.get("touchTotalPoints") or b.get("touchEvents") or 0
+    if touch_points < 3:
+        return detections
+
+    force_variance = b.get("touchForceVariance", 0) or 0
+    radius_variance = b.get("touchRadiusVariance", 0) or 0
+    force_all_one = b.get("touchForceAllOne") is True
+    unique_ids = b.get("touchUniqueIdentifiers", 0) or 0
+    force_max = b.get("touchForceMax", 0) or 0
+    radius_max = b.get("touchRadiusMax", 0) or 0
+
+    # Uniform non-zero force across all events → synthetic injection.
+    # Older Android returning all-zero is legitimate — only penalize uniformity
+    # when max > 0.
+    if force_variance == 0 and force_max > 0 and touch_points >= 5:
+        detections.append(Detection(
+            ThreatCategory.BEHAVIORAL, 0.75, 0.85,
+            "Touch force is identical across all events (synthetic touch)"
+        ))
+
+    if force_all_one and touch_points >= 5:
+        detections.append(Detection(
+            ThreatCategory.BEHAVIORAL, 0.8, 0.9,
+            "All touches report force=1.0 exactly (synthetic pattern)"
+        ))
+
+    if radius_variance == 0 and radius_max > 0 and touch_points >= 5:
+        detections.append(Detection(
+            ThreatCategory.BEHAVIORAL, 0.7, 0.8,
+            "Touch contact radius identical across all events"
+        ))
+
+    if touch_points >= 5 and unique_ids == 0:
+        detections.append(Detection(
+            ThreatCategory.BEHAVIORAL, 0.6, 0.7,
+            "Mobile touches lack identifier tracking (synthetic injection)"
+        ))
+
+    return detections
+
+
+def detect_sensor_entropy(signals: Dict, user_agent: str) -> List[Detection]:
+    detections: List[Detection] = []
+    if not _is_mobile_ua(user_agent):
+        return detections
+
+    env = signals.get("environmental", {}) or {}
+    sensor = env.get("sensor", {}) or {}
+    motion_count = sensor.get("motionEventCount", 0) or 0
+    motion_variance = sensor.get("motionAccelVariance", 0) or 0
+    orientation_count = sensor.get("orientationEventCount", 0) or 0
+    orientation_variance = sensor.get("orientationVariance", 0) or 0
+
+    if motion_count >= 10 and motion_variance < 0.01:
+        detections.append(Detection(
+            ThreatCategory.HEADLESS, 0.7, 0.8,
+            f"Motion sensor active but flat (variance={motion_variance:.4f}) — likely emulator"
+        ))
+
+    if orientation_count >= 10 and orientation_variance < 0.01:
+        detections.append(Detection(
+            ThreatCategory.HEADLESS, 0.6, 0.7,
+            "Orientation sensor active but completely flat — likely emulator"
+        ))
+
+    # motion_count == 0 is NEUTRAL (iOS without permission is common).
+    return detections
+
+
+def detect_touch_kinematics(signals: Dict) -> List[Detection]:
+    detections: List[Detection] = []
+    b = signals.get("behavioral", {}) or {}
+    touch_points = b.get("touchTotalPoints", 0) or 0
+    if touch_points < 10:
+        return detections
+
+    straight_line = b.get("touchStraightLineRatio", 0) or 0
+    tremor = b.get("touchMicroTremorScore", 0) or 0
+    dir_changes = b.get("touchDirectionChanges", 0) or 0
+
+    if straight_line > 0.85 and touch_points >= 20:
+        detections.append(Detection(
+            ThreatCategory.BEHAVIORAL, 0.65, 0.75,
+            f"Touch path too straight (ratio={straight_line:.2f}) — automation pattern"
+        ))
+
+    if tremor < 0.05 and touch_points >= 30:
+        detections.append(Detection(
+            ThreatCategory.BEHAVIORAL, 0.55, 0.65,
+            "Touch path has no micro-tremor (unnaturally smooth)"
+        ))
+
+    if dir_changes == 0 and touch_points >= 30:
+        detections.append(Detection(
+            ThreatCategory.BEHAVIORAL, 0.5, 0.6,
+            "Touch path has zero direction changes over long trajectory"
         ))
 
     return detections
@@ -828,6 +948,7 @@ def run_verification(
     from detection import (
         check_ip_reputation, analyze_headers,
         check_browser_consistency, check_ja3_fingerprint,
+        check_ja4_fingerprint, get_trusted_ja4_header_names, read_ja4_from_headers,
         analyze_form_interaction
     )
 
@@ -895,6 +1016,9 @@ def run_verification(
     detections.extend(detect_automation(signals))
     detections.extend(detect_cdp(signals))
     detections.extend(detect_behavioral(signals))
+    detections.extend(detect_touch_authenticity(signals, user_agent))
+    detections.extend(detect_sensor_entropy(signals, user_agent))
+    detections.extend(detect_touch_kinematics(signals))
     detections.extend(detect_fingerprint(signals, ip, site_key))
     detections.extend(detect_rate_abuse(ip, site_key))
 
@@ -917,12 +1041,27 @@ def run_verification(
                 ThreatCategory.BOT, d["score"], d["confidence"], d["reason"]
             ))
 
-    # TLS fingerprint
+    # TLS fingerprint (JA3) — client-supplied, spoofable
     if ja3_hash:
         for d in check_ja3_fingerprint(ja3_hash):
             detections.append(Detection(
                 ThreatCategory.BOT, d["score"], d["confidence"], d["reason"]
             ))
+
+    # TLS fingerprint (JA4) — trusted reverse-proxy header, un-spoofable by client
+    trusted_ja4_headers = get_trusted_ja4_header_names()
+    if headers and trusted_ja4_headers:
+        ja4 = read_ja4_from_headers(headers, trusted_ja4_headers)
+        if ja4:
+            for d in check_ja4_fingerprint(ja4):
+                cat = d["category"]
+                if cat in [e.value for e in ThreatCategory]:
+                    category = ThreatCategory(cat)
+                else:
+                    category = ThreatCategory.FINGERPRINT
+                detections.append(Detection(
+                    category, d["score"], d["confidence"], d["reason"]
+                ))
 
     # Form interaction analysis (credential stuffing & spam detection)
     form_analysis = signals.get("formAnalysis")

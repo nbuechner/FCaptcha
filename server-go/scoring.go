@@ -329,6 +329,9 @@ func (e *ScoringEngine) VerifyWithHeaders(signals map[string]interface{}, ip, si
 	detections = append(detections, e.detectAutomation(signals)...)
 	detections = append(detections, e.detectCDP(signals)...)
 	detections = append(detections, e.detectBehavioral(signals)...)
+	detections = append(detections, e.detectTouchAuthenticity(signals, userAgent)...)
+	detections = append(detections, e.detectSensorEntropy(signals, userAgent)...)
+	detections = append(detections, e.detectTouchKinematics(signals)...)
 	detections = append(detections, e.detectFingerprint(signals, ip, siteKey)...)
 	detections = append(detections, e.detectRateAbuse(ip, siteKey)...)
 
@@ -341,9 +344,19 @@ func (e *ScoringEngine) VerifyWithHeaders(signals map[string]interface{}, ip, si
 		detections = append(detections, e.AnalyzeHeaders(headers)...)
 	}
 
-	// TLS fingerprint (if available from reverse proxy)
+	// TLS fingerprint (JA3) — client-supplied, spoofable
 	if ja3Hash != "" {
 		detections = append(detections, e.CheckJA3Fingerprint(ja3Hash)...)
+	}
+
+	// TLS fingerprint (JA4) — trusted reverse-proxy header, un-spoofable by client
+	if headers != nil {
+		trustedJA4 := GetTrustedJA4HeaderNames()
+		if len(trustedJA4) > 0 {
+			if ja4 := ReadJA4FromHeaders(headers, trustedJA4); ja4 != "" {
+				detections = append(detections, e.CheckJA4Fingerprint(ja4)...)
+			}
+		}
 	}
 
 	// Form interaction analysis (credential stuffing & spam detection)
@@ -636,7 +649,7 @@ func (e *ScoringEngine) detectVisionAI(signals map[string]interface{}) []Detecti
 	approachPts := getFloat(behavioral, "approachPoints")
 	touchEventsAI := getFloat(behavioral, "touchEvents")
 	keyEventsAI := getFloat(behavioral, "keyEvents")
-	isTouchUser := touchEventsAI >= 1
+	isTouchUser := touchEventsAI >= 3
 	isKeyboardUser := keyEventsAI >= 2 && totalPoints == 0
 
 	if totalPoints < 5 && trajectoryLen < 10 && !isTouchUser && !isKeyboardUser {
@@ -1011,7 +1024,7 @@ func (e *ScoringEngine) detectBehavioral(signals map[string]interface{}) []Detec
 	trajectoryLength := getFloat(behavioral, "trajectoryLength")
 	touchEvents := getFloat(behavioral, "touchEvents")
 	keyEvents := getFloat(behavioral, "keyEvents")
-	isTouchUsr := touchEvents >= 1
+	isTouchUsr := touchEvents >= 3
 	isKbdUsr := keyEvents >= 2 && totalPoints == 0
 
 	if totalPoints == 0 && !isTouchUsr && !isKbdUsr {
@@ -1123,6 +1136,171 @@ func (e *ScoringEngine) detectBehavioral(signals map[string]interface{}) []Detec
 			Score:      0.4,
 			Confidence: 0.4,
 			Reason:     "Too few direction changes in mouse movement",
+		})
+	}
+
+	return results
+}
+
+// ============================================================
+// Mobile-native detectors (touch authenticity, sensor entropy, touch kinematics)
+// UA-gated on mobile. Non-mobile UAs: no-op. Designed never to penalize iOS
+// Safari without DeviceMotion permission (absence treated as neutral).
+// ============================================================
+
+var mobileUARegex = regexp.MustCompile(`(?i)mobile|android|iphone|ipad|ipod`)
+
+func isMobileUA(userAgent string) bool {
+	if userAgent == "" {
+		return false
+	}
+	return mobileUARegex.MatchString(userAgent)
+}
+
+func (e *ScoringEngine) detectTouchAuthenticity(signals map[string]interface{}, userAgent string) []DetectionResult {
+	results := make([]DetectionResult, 0)
+	if !isMobileUA(userAgent) {
+		return results
+	}
+
+	b := getMap(signals, "behavioral")
+	if b == nil {
+		return results
+	}
+
+	touchPoints := getFloat(b, "touchTotalPoints")
+	if touchPoints == 0 {
+		touchPoints = getFloat(b, "touchEvents")
+	}
+	if touchPoints < 3 {
+		return results
+	}
+
+	forceVariance := getFloat(b, "touchForceVariance")
+	radiusVariance := getFloat(b, "touchRadiusVariance")
+	forceAllOne := getBool(b, "touchForceAllOne")
+	uniqueIds := getFloat(b, "touchUniqueIdentifiers")
+	forceMax := getFloat(b, "touchForceMax")
+	radiusMax := getFloat(b, "touchRadiusMax")
+
+	if forceVariance == 0 && forceMax > 0 && touchPoints >= 5 {
+		results = append(results, DetectionResult{
+			Category:   CategoryBehavioral,
+			Score:      0.75,
+			Confidence: 0.85,
+			Reason:     "Touch force is identical across all events (synthetic touch)",
+		})
+	}
+
+	if forceAllOne && touchPoints >= 5 {
+		results = append(results, DetectionResult{
+			Category:   CategoryBehavioral,
+			Score:      0.8,
+			Confidence: 0.9,
+			Reason:     "All touches report force=1.0 exactly (synthetic pattern)",
+		})
+	}
+
+	if radiusVariance == 0 && radiusMax > 0 && touchPoints >= 5 {
+		results = append(results, DetectionResult{
+			Category:   CategoryBehavioral,
+			Score:      0.7,
+			Confidence: 0.8,
+			Reason:     "Touch contact radius identical across all events",
+		})
+	}
+
+	if touchPoints >= 5 && uniqueIds == 0 {
+		results = append(results, DetectionResult{
+			Category:   CategoryBehavioral,
+			Score:      0.6,
+			Confidence: 0.7,
+			Reason:     "Mobile touches lack identifier tracking (synthetic injection)",
+		})
+	}
+
+	return results
+}
+
+func (e *ScoringEngine) detectSensorEntropy(signals map[string]interface{}, userAgent string) []DetectionResult {
+	results := make([]DetectionResult, 0)
+	if !isMobileUA(userAgent) {
+		return results
+	}
+
+	env := getMap(signals, "environmental")
+	sensor := getMap(env, "sensor")
+	if sensor == nil {
+		return results
+	}
+
+	motionCount := getFloat(sensor, "motionEventCount")
+	motionVariance := getFloat(sensor, "motionAccelVariance")
+	orientationCount := getFloat(sensor, "orientationEventCount")
+	orientationVariance := getFloat(sensor, "orientationVariance")
+
+	if motionCount >= 10 && motionVariance < 0.01 {
+		results = append(results, DetectionResult{
+			Category:   CategoryHeadless,
+			Score:      0.7,
+			Confidence: 0.8,
+			Reason:     fmt.Sprintf("Motion sensor active but flat (variance=%.4f) — likely emulator", motionVariance),
+		})
+	}
+
+	if orientationCount >= 10 && orientationVariance < 0.01 {
+		results = append(results, DetectionResult{
+			Category:   CategoryHeadless,
+			Score:      0.6,
+			Confidence: 0.7,
+			Reason:     "Orientation sensor active but completely flat — likely emulator",
+		})
+	}
+
+	// motionCount == 0 is NEUTRAL (iOS without permission).
+	return results
+}
+
+func (e *ScoringEngine) detectTouchKinematics(signals map[string]interface{}) []DetectionResult {
+	results := make([]DetectionResult, 0)
+	b := getMap(signals, "behavioral")
+	if b == nil {
+		return results
+	}
+
+	touchPoints := getFloat(b, "touchTotalPoints")
+	if touchPoints < 10 {
+		return results
+	}
+
+	straightLine := getFloat(b, "touchStraightLineRatio")
+	tremor := getFloat(b, "touchMicroTremorScore")
+	dirChanges := getFloat(b, "touchDirectionChanges")
+
+	if straightLine > 0.85 && touchPoints >= 20 {
+		results = append(results, DetectionResult{
+			Category:   CategoryBehavioral,
+			Score:      0.65,
+			Confidence: 0.75,
+			Reason:     fmt.Sprintf("Touch path too straight (ratio=%.2f) — automation pattern", straightLine),
+		})
+	}
+
+	if tremor < 0.05 && touchPoints >= 30 {
+		results = append(results, DetectionResult{
+			Category:   CategoryBehavioral,
+			Score:      0.55,
+			Confidence: 0.65,
+			Reason:     "Touch path has no micro-tremor (unnaturally smooth)",
+		})
+	}
+
+	if dirChanges == 0 && touchPoints >= 30 {
+		results = append(results, DetectionResult{
+			Category:   CategoryBehavioral,
+			Score:      0.5,
+			Confidence: 0.6,
+			Reason:     "Touch path has zero direction changes over long trajectory",
 		})
 	}
 

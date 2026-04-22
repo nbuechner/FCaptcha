@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -476,6 +477,75 @@ func (e *ScoringEngine) CheckJA3Fingerprint(ja3Hash string) []DetectionResult {
 		})
 	}
 
+	return detections
+}
+
+// =============================================================================
+// TLS Fingerprinting (JA4) — read from trusted reverse-proxy headers
+// =============================================================================
+//
+// Unlike the client-supplied X-JA3-Hash (spoofable), JA4 fingerprints are
+// computed from the TLS ClientHello by the reverse proxy and passed via a
+// trusted header the server is configured to accept via TRUSTED_JA4_HEADERS.
+
+// knownBotJA4Hashes holds observed automation fingerprints.
+// Populate in production; entries below are placeholders.
+// JA4 format: t##d####_####..._####
+var knownBotJA4Hashes = map[string]string{
+	// Example once identified:
+	//   "t13d1516h2_8daaf6152771_02713d6af862": "Go default stdlib TLS",
+}
+
+// GetTrustedJA4HeaderNames reads TRUSTED_JA4_HEADERS env var (comma-separated).
+func GetTrustedJA4HeaderNames() []string {
+	env := os.Getenv("TRUSTED_JA4_HEADERS")
+	if env == "" {
+		return nil
+	}
+	names := []string{}
+	for _, part := range strings.Split(env, ",") {
+		p := strings.ToLower(strings.TrimSpace(part))
+		if p != "" {
+			names = append(names, p)
+		}
+	}
+	return names
+}
+
+// ReadJA4FromHeaders returns the first non-empty value from the trusted header list.
+func ReadJA4FromHeaders(headers map[string]string, trusted []string) string {
+	if len(trusted) == 0 || headers == nil {
+		return ""
+	}
+	lower := make(map[string]string, len(headers))
+	for k, v := range headers {
+		lower[strings.ToLower(k)] = v
+	}
+	for _, name := range trusted {
+		if v, ok := lower[name]; ok {
+			if v = strings.TrimSpace(v); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// CheckJA4Fingerprint matches a JA4 hash against known automation fingerprints.
+func (e *ScoringEngine) CheckJA4Fingerprint(ja4 string) []DetectionResult {
+	var detections []DetectionResult
+	if ja4 == "" {
+		return detections
+	}
+	if botName, ok := knownBotJA4Hashes[ja4]; ok {
+		detections = append(detections, DetectionResult{
+			Category:   CategoryFingerprint,
+			Score:      0.8,
+			Confidence: 0.9,
+			Reason:     "TLS JA4 fingerprint matches known automation tool",
+			Details:    map[string]interface{}{"ja4": ja4, "tool": botName},
+		})
+	}
 	return detections
 }
 
