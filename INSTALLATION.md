@@ -57,6 +57,20 @@ Open `demo/index.html` in your browser to test.
 
 ---
 
+## How the widget reaches the browser
+
+FCaptcha ships in two halves: an HTTP API (`server-node`, `server-python`, `server-go`) and a browser widget (`client/fcaptcha.js`).
+
+**By default, `server-node` serves the widget at `/fcaptcha.js` from the same origin as the API.** Integrators that expose a single `serverUrl` to their clients (and load the widget from `<serverUrl>/fcaptcha.js`) work out of the box. Most consumers want this.
+
+If you'd rather host the widget on a CDN or edge cache and only run the API from the FCaptcha server, set `FCAPTCHA_SERVE_CLIENT=false` and serve `client/fcaptcha.js` yourself from wherever fits your infrastructure. Point your widget loader at that URL.
+
+If you've copied `server-node/` to a location where the sibling `client/` directory isn't present, set `FCAPTCHA_CLIENT_PATH=/absolute/path/to/fcaptcha.js` to override the default lookup.
+
+The Go server (`server-go`) already serves `/fcaptcha.js` via its embedded static directory. The Python server (`server-python`) does not yet — track [issue #4](https://github.com/WebDecoy/FCaptcha/issues/4) for parity.
+
+---
+
 ## Server Installation
 
 ### Node.js Server

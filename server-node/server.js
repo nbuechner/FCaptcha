@@ -7,6 +7,7 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const path = require('path');
 const detection = require('./detection');
 
 const app = express();
@@ -16,6 +17,20 @@ app.use(express.json());
 const SECRET_KEY = process.env.FCAPTCHA_SECRET || 'dev-secret-change-in-production';
 const PORT = process.env.PORT || 3000;
 const TRUSTED_JA4_HEADERS = detection.getTrustedJA4HeaderNames();
+
+// Serve the browser widget alongside the API so deployments expose a single
+// origin to integrators (the implicit contract behind <serverUrl>/fcaptcha.js).
+// Set FCAPTCHA_SERVE_CLIENT=false to opt out — useful when hosting the widget
+// on a separate CDN / edge cache. Set FCAPTCHA_CLIENT_PATH=/abs/path/fcaptcha.js
+// to override the default lookup when server-node is deployed standalone.
+const CLIENT_PATH = process.env.FCAPTCHA_CLIENT_PATH
+  || path.join(__dirname, '..', 'client', 'fcaptcha.js');
+
+if (process.env.FCAPTCHA_SERVE_CLIENT !== 'false') {
+  app.get('/fcaptcha.js', (req, res) => {
+    res.sendFile(CLIENT_PATH);
+  });
+}
 
 // =============================================================================
 // In-Memory Storage (Use Redis in production)
