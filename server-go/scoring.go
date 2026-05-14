@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hashicorp/golang-lru/v2/expirable"
 )
 
 // ThreatCategory represents types of detected threats
@@ -82,17 +84,25 @@ type PoWVerifyResult struct {
 	Nonce         string
 }
 
-// PoWChallengeStore manages challenges
+// PoWChallengeStore manages challenges and replay-protects spent solutions.
+// usedSolutions is a bounded LRU with TTL — under attack it caps memory and
+// evicts the oldest entries, instead of the previous behavior of wiping all
+// entries when count crossed a threshold (which opened a replay window).
 type PoWChallengeStore struct {
 	mu            sync.RWMutex
 	challenges    map[string]*PoWChallenge
-	usedSolutions map[string]bool
+	usedSolutions *expirable.LRU[string, struct{}]
 }
+
+const (
+	usedSolutionsCap = 100_000
+	usedSolutionsTTL = 10 * time.Minute
+)
 
 func newPoWChallengeStore() *PoWChallengeStore {
 	store := &PoWChallengeStore{
 		challenges:    make(map[string]*PoWChallenge),
-		usedSolutions: make(map[string]bool),
+		usedSolutions: expirable.NewLRU[string, struct{}](usedSolutionsCap, nil, usedSolutionsTTL),
 	}
 	// Start cleanup goroutine
 	go store.cleanupLoop()
@@ -116,11 +126,33 @@ func (s *PoWChallengeStore) cleanup() {
 			delete(s.challenges, id)
 		}
 	}
+	// usedSolutions evicts via cap + TTL; no manual sweep needed.
+}
 
-	// Clear used solutions if too many
-	if len(s.usedSolutions) > 10000 {
-		s.usedSolutions = make(map[string]bool)
+// IsSolutionUsed is a non-locking best-effort early-out to reject obvious
+// replays before doing any hash verification work. The authoritative
+// test-and-set is MarkSolutionUsed.
+func (s *PoWChallengeStore) IsSolutionUsed(key string) bool {
+	return s.usedSolutions.Contains(key)
+}
+
+// MarkSolutionUsed atomically claims a (challengeID, nonce) pair, returning
+// false if another caller already marked it (treat as replay).
+func (s *PoWChallengeStore) MarkSolutionUsed(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.usedSolutions.Contains(key) {
+		return false
 	}
+	s.usedSolutions.Add(key, struct{}{})
+	return true
+}
+
+// DeleteChallenge removes a one-time challenge after it has been spent.
+func (s *PoWChallengeStore) DeleteChallenge(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.challenges, id)
 }
 
 // Legacy Challenge for backward compatibility
@@ -160,45 +192,37 @@ type FingerprintData struct {
 	IPs       map[string]bool
 }
 
-// TokenStore prevents token replay attacks
+// TokenStore prevents token replay attacks. Backed by a bounded LRU with TTL
+// so the store size is capped under sustained load and the previous O(n)
+// inline cleanup (which scanned the whole map under the write lock on every
+// 100th insert past 1000) is gone.
 type TokenStore struct {
-	mu         sync.RWMutex
-	usedTokens map[string]int64 // sig -> timestamp when used
+	mu    sync.Mutex
+	cache *expirable.LRU[string, struct{}]
 }
+
+const (
+	usedTokensCap = 100_000
+	usedTokensTTL = 10 * time.Minute
+)
 
 func newTokenStore() *TokenStore {
 	return &TokenStore{
-		usedTokens: make(map[string]int64),
+		cache: expirable.NewLRU[string, struct{}](usedTokensCap, nil, usedTokensTTL),
 	}
 }
 
 func (t *TokenStore) IsUsed(sig string) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	_, exists := t.usedTokens[sig]
-	return exists
+	return t.cache.Contains(sig)
 }
 
 func (t *TokenStore) MarkUsed(sig string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
-	if _, exists := t.usedTokens[sig]; exists {
-		return false // Already used
+	if t.cache.Contains(sig) {
+		return false
 	}
-
-	t.usedTokens[sig] = time.Now().Unix()
-
-	// Cleanup old tokens (older than 10 min) periodically
-	if len(t.usedTokens) > 1000 && len(t.usedTokens)%100 == 0 {
-		cutoff := time.Now().Unix() - 600
-		for s, ts := range t.usedTokens {
-			if ts < cutoff {
-				delete(t.usedTokens, s)
-			}
-		}
-	}
-
+	t.cache.Add(sig, struct{}{})
 	return true
 }
 
@@ -499,9 +523,9 @@ func (e *ScoringEngine) VerifyPoWSolution(solution *PoWSolution, siteKey string,
 		return PoWVerifyResult{Valid: false, Reason: "site_key_mismatch"}
 	}
 
-	// Check if solution was already used
+	// Cheap early-out for obvious replays before doing hash work.
 	solutionKey := solution.ChallengeID + ":" + formatInt(solution.Nonce)
-	if e.powStore.usedSolutions[solutionKey] {
+	if e.powStore.IsSolutionUsed(solutionKey) {
 		return PoWVerifyResult{Valid: false, Reason: "solution_already_used"}
 	}
 
@@ -525,14 +549,17 @@ func (e *ScoringEngine) VerifyPoWSolution(solution *PoWSolution, siteKey string,
 		return PoWVerifyResult{Valid: false, Reason: "insufficient_difficulty"}
 	}
 
-	// Mark solution as used
-	e.powStore.usedSolutions[solutionKey] = true
+	// Atomic claim — guards against the race where two concurrent verifications
+	// both pass IsSolutionUsed above before either commits.
+	if !e.powStore.MarkSolutionUsed(solutionKey) {
+		return PoWVerifyResult{Valid: false, Reason: "solution_already_used"}
+	}
 
 	// Calculate server-side elapsed time (un-spoofable)
 	serverElapsed := now - challenge.Timestamp
 
 	// Delete challenge (one-time use)
-	delete(e.powStore.challenges, solution.ChallengeID)
+	e.powStore.DeleteChallenge(solution.ChallengeID)
 
 	return PoWVerifyResult{Valid: true, Difficulty: challenge.Difficulty, ServerElapsed: serverElapsed, Nonce: challenge.Nonce}
 }
