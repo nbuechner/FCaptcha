@@ -1797,7 +1797,7 @@
 
   class PoWManager {
     constructor() {
-      this.worker = null;
+      this.workers = [];
       this.challenge = null;
       this.solution = null;
       this.solving = false;
@@ -1805,7 +1805,9 @@
       this.startTime = null;
     }
 
-    // Create inline Web Worker for PoW computation
+    // Create inline Web Worker for PoW computation.
+    // Each worker scans a disjoint nonce slice via (startNonce + k*stride),
+    // so N workers explore the search space N-way in parallel.
     _createWorker() {
       const workerCode = `
         async function sha256(message) {
@@ -1816,9 +1818,9 @@
         }
 
         self.onmessage = async function(e) {
-          const { prefix, difficulty, signalsHash, batchSize = 10000 } = e.data;
+          const { prefix, difficulty, signalsHash, startNonce = 0, stride = 1, batchSize = 10000 } = e.data;
           const target = '0'.repeat(difficulty);
-          let nonce = 0;
+          let nonce = startNonce;
           let iterations = 0;
           const startTime = performance.now();
 
@@ -1841,7 +1843,7 @@
                 });
                 return;
               }
-              nonce++;
+              nonce += stride;
             }
 
             // Report progress every batch
@@ -1856,6 +1858,20 @@
 
       const blob = new Blob([workerCode], { type: 'application/javascript' });
       return new Worker(URL.createObjectURL(blob));
+    }
+
+    // Pick a worker count that uses available cores without monopolizing them.
+    // Half of hardwareConcurrency leaves headroom for the page itself.
+    _threadCount() {
+      const hc = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 1;
+      return Math.max(1, Math.floor(hc / 2));
+    }
+
+    _terminateWorkers() {
+      for (const w of this.workers) {
+        try { w.terminate(); } catch (_) { /* ignore */ }
+      }
+      this.workers = [];
     }
 
     // Fetch challenge from server
@@ -1914,39 +1930,57 @@
       this.startTime = performance.now();
 
       this.solvePromise = new Promise((resolve, reject) => {
-        this.worker = this._createWorker();
+        const threads = this._threadCount();
+        let settled = false;
 
-        this.worker.onmessage = (e) => {
-          if (e.data.found) {
-            this.solution = {
-              challengeId: this.challenge.challengeId,
-              nonce: e.data.nonce,
-              hash: e.data.hash,
-              iterations: e.data.iterations,
-              duration: e.data.duration,
-              difficulty: this.challenge.difficulty,
-              signalsHash: signalsHash || null,
-              local: this.challenge.local || false
-            };
-            this.solving = false;
-            this.worker.terminate();
-            resolve(this.solution);
-          }
-          // Progress updates can be used for UI if needed
-        };
-
-        this.worker.onerror = (e) => {
+        const finish = (fn, value) => {
+          if (settled) return;
+          settled = true;
           this.solving = false;
-          reject(e);
+          this._terminateWorkers();
+          fn(value);
         };
 
-        // Start solving with optional signalsHash
-        this.worker.postMessage({
-          prefix: this.challenge.prefix,
-          difficulty: this.challenge.difficulty,
-          signalsHash: signalsHash || null,
-          batchSize: 5000
-        });
+        for (let i = 0; i < threads; i++) {
+          const worker = this._createWorker();
+
+          worker.onmessage = (e) => {
+            if (e.data.found) {
+              // Report the winning worker's iteration count, not the sum across
+              // workers. With N-way striding the winner has explored ~total/N
+              // iterations in wall-clock time ~total/(N*rate), so the ratio
+              // iterations/duration stays at the per-thread browser hash rate
+              // that server-side timing detection (server.js) expects.
+              this.solution = {
+                challengeId: this.challenge.challengeId,
+                nonce: e.data.nonce,
+                hash: e.data.hash,
+                iterations: e.data.iterations,
+                duration: e.data.duration,
+                difficulty: this.challenge.difficulty,
+                signalsHash: signalsHash || null,
+                local: this.challenge.local || false
+              };
+              finish(resolve, this.solution);
+            }
+            // Progress updates can be used for UI if needed
+          };
+
+          worker.onerror = (e) => {
+            finish(reject, e);
+          };
+
+          worker.postMessage({
+            prefix: this.challenge.prefix,
+            difficulty: this.challenge.difficulty,
+            signalsHash: signalsHash || null,
+            startNonce: i,
+            stride: threads,
+            batchSize: 5000
+          });
+
+          this.workers.push(worker);
+        }
       });
 
       return this.solvePromise;
@@ -1961,10 +1995,7 @@
 
     // Reset for new challenge
     reset() {
-      if (this.worker) {
-        this.worker.terminate();
-        this.worker = null;
-      }
+      this._terminateWorkers();
       this.challenge = null;
       this.solution = null;
       this.solving = false;
