@@ -180,7 +180,7 @@ FCaptcha collects signals across multiple categories:
 
 ### Proof of Work (Invisible Layer)
 Before any verification, clients must solve a SHA-256 hashcash challenge:
-- **Challenge fetched on page load** - solving happens in background via Web Worker
+- **Challenge fetched on page load** - solving runs in the background across parallel Web Workers (one per ~2 CPU cores)
 - **Non-blocking** - users never see it, computation happens while they fill forms
 - **Server-verified** - one-time use, replay protected, signed challenges
 - **Difficulty scaling** - datacenter IPs and high-rate requesters get harder puzzles
@@ -346,7 +346,7 @@ Verify a previously issued token (server-side).
 ```
 fcaptcha/
 ├── client/
-│   └── fcaptcha.js          # Client-side widget, signal collection, PoW Web Worker
+│   └── fcaptcha.js          # Client-side widget, signal collection, parallel PoW Web Workers
 ├── server-go/
 │   ├── main.go              # Go HTTP server + static file serving
 │   ├── scoring.go           # Scoring engine + PoW verification
