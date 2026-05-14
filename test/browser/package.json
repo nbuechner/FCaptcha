@@ -1,0 +1,13 @@
+{
+  "name": "@webdecoy/fcaptcha-browser-tests",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Playwright tests that exercise the FCaptcha client widget in real browsers",
+  "scripts": {
+    "test": "playwright test",
+    "install-browsers": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0"
+  }
+}
