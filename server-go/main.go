@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +18,35 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 )
+
+// resolveClientPath finds client/fcaptcha.js at startup so the widget can be
+// served from the same origin as the API (matches the Node and Python servers).
+// FCAPTCHA_CLIENT_PATH wins; otherwise we probe a few sensible defaults so this
+// works for `go run .` from server-go/, a built binary alongside the repo, and
+// the Docker image (which COPYs the file to /app/client/fcaptcha.js).
+func resolveClientPath() string {
+	if p := os.Getenv("FCAPTCHA_CLIENT_PATH"); p != "" {
+		return p
+	}
+	candidates := []string{
+		"./client/fcaptcha.js",
+		"../client/fcaptcha.js",
+	}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(dir, "client", "fcaptcha.js"),
+			filepath.Join(dir, "..", "client", "fcaptcha.js"),
+		)
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			abs, _ := filepath.Abs(c)
+			return abs
+		}
+	}
+	return ""
+}
 
 func main() {
 	// Configuration
@@ -59,9 +89,22 @@ func main() {
 		MaxAge:           300,
 	}))
 
-	// Static file serving (for Docker/standalone deployment)
+	// Serve the widget from the same origin as the API (matches server-node
+	// and server-python). 404 if the client file isn't reachable so callers
+	// see the configuration problem instead of a confusing empty response.
+	clientPath := resolveClientPath()
+	if clientPath == "" {
+		log.Printf("warning: client/fcaptcha.js not found; /fcaptcha.js will return 404. Set FCAPTCHA_CLIENT_PATH to override.")
+	} else {
+		log.Printf("serving /fcaptcha.js from %s", clientPath)
+	}
 	r.Get("/fcaptcha.js", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "./static/fcaptcha.js")
+		if clientPath == "" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/javascript")
+		http.ServeFile(w, r, clientPath)
 	})
 	r.Handle("/demo/*", http.StripPrefix("/demo/", http.FileServer(http.Dir("./static/demo"))))
 

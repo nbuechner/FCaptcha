@@ -16,6 +16,9 @@ RUN apk --no-cache add ca-certificates tzdata
 WORKDIR /app
 
 COPY --from=builder /app/fcaptcha-server .
+# Widget bundle served at /fcaptcha.js — must live next to the binary so
+# resolveClientPath in main.go finds it without an env override.
+COPY client/fcaptcha.js ./client/fcaptcha.js
 
 EXPOSE 3000
 
