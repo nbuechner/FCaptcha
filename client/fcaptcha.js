@@ -11,7 +11,9 @@
   'use strict';
 
   const FCaptcha = {
-    version: '1.0.0',
+    // Keep in sync with server-node/package.json and server-python/server.py
+    // when cutting a release; this string ships to integrators.
+    version: '1.10.1',
     widgets: new Map(),
     serverUrl: null,
   };

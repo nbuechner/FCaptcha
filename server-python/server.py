@@ -21,7 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="FCaptcha", version="1.0.0")
+# Keep in sync with server-node/package.json and client/fcaptcha.js on release.
+app = FastAPI(title="FCaptcha", version="1.10.1")
 
 app.add_middleware(
     CORSMiddleware,
